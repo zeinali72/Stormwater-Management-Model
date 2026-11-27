@@ -334,6 +334,17 @@ if(OPENSWMM_FAST_XSECT_LOOKUP)
     target_compile_definitions(test_engine_xsect_kernels_parity
                                PRIVATE SWMM_XSECT_FAST_LOOKUP)
 endif()
+# Dynamic-wave device kernels (hydraulics/dw/DwKernels.hpp): the link geometry stage matches
+# DWSolver::computeLinkGeometry bit for bit at every Picard iteration of the test's decks and of
+# a few in-scope repository models.
+add_gtest_unit(test_dw_kernels_geometry test_dw_kernels_geometry.cpp)
+target_compile_definitions(test_dw_kernels_geometry PRIVATE
+    OPENSWMM_DWK_REPO_ROOT="${PROJECT_SOURCE_DIR}"
+    OPENSWMM_DWK_DECK_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data/dw_kernels_geometry"
+    OPENSWMM_DWK_OUT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data/dw_kernels_geometry_out")
+if(OPENSWMM_FAST_XSECT_LOOKUP)
+    target_compile_definitions(test_dw_kernels_geometry PRIVATE SWMM_XSECT_FAST_LOOKUP)
+endif()
 # GUI editor round-trip getters/setters (pollutant units, aquifer ET pattern,
 # snowpack surfaces, inlet params/type, LID layers/type).
 add_gtest_unit(test_engine_editor_roundtrip_api test_editor_roundtrip_api.cpp)

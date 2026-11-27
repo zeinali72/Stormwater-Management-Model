@@ -1,0 +1,169 @@
+[TITLE]
+;;Project Title/Notes
+Dynamic-wave geometry kernel parity (US units). A trunk backed up by a FIXED
+outfall, a branch of drop manholes (invert offsets), an undersized branch that
+surcharges and floods, a branch that stays dry, and small systems draining to a
+FREE and a NORMAL outfall. G2 surcharges behind an undersized outlet and pushes
+water back up CG1 into the drop manhole G1 (reverse flow over an invert offset).
+CIRCULAR and RECT_CLOSED conduits, one barrel each.
+
+[OPTIONS]
+;;Option             Value
+FLOW_UNITS           CFS
+INFILTRATION         HORTON
+FLOW_ROUTING         DYNWAVE
+LINK_OFFSETS         DEPTH
+MIN_SLOPE            0
+ALLOW_PONDING        NO
+SKIP_STEADY_STATE    NO
+START_DATE           01/01/2024
+START_TIME           00:00:00
+REPORT_START_DATE    01/01/2024
+REPORT_START_TIME    00:00:00
+END_DATE             01/01/2024
+END_TIME             06:00:00
+SWEEP_START          01/01
+SWEEP_END            12/31
+DRY_DAYS             0
+REPORT_STEP          00:15:00
+WET_STEP             00:05:00
+DRY_STEP             01:00:00
+ROUTING_STEP         0:00:05
+RULE_STEP            00:00:00
+INERTIAL_DAMPING     PARTIAL
+NORMAL_FLOW_LIMITED  BOTH
+FORCE_MAIN_EQUATION  H-W
+VARIABLE_STEP        0
+LENGTHENING_STEP     0
+MIN_SURFAREA         12.566
+MAX_TRIALS           8
+HEAD_TOLERANCE       0.005
+SYS_FLOW_TOL         5
+LAT_FLOW_TOL         5
+MINIMUM_STEP         0.5
+THREADS              1
+SURCHARGE_METHOD     EXTRAN
+
+[JUNCTIONS]
+;;Name           Elevation  MaxDepth   InitDepth  SurDepth   Aponded
+J1               100.0      8          0          0          0
+J2               98.5       8          0          0          0
+J3               97.0       8          0          0          0
+J4               95.5       8          0          0          0
+J5               94.0       8          0          0          0
+J6               92.5       8          0          0          0
+A1               106.0      6          0          0          0
+A2               103.0      6          0          0          0
+A3               100.0      6          0          0          0
+B1               104.0      6          0          0          0
+B2               102.0      4          0          0          0
+B3               100.0      4          0          0          0
+C1               103.0      5          0          0          0
+C2               102.0      5          0          0          0
+D1               99.0       5          0          0          0
+D2               98.0       5          0          0          0
+E1               99.0       5          0          0          0
+G1               100.0      5          0          0          0
+G2               99.0       6          0          0          0
+
+[OUTFALLS]
+;;Name           Elevation  Type       Stage Data       Gated    Route To
+O1               91.0       FIXED      95.0             NO
+O2               97.0       FREE                        NO
+O3               98.0       NORMAL                      NO
+O4               96.0       FREE                        NO
+O5               98.0       FREE                        NO
+
+[CONDUITS]
+;;Name           From Node        To Node          Length     Roughness  InOffset   OutOffset  InitFlow   MaxFlow
+T1               J1               J2               400        0.013      0          0          0          0
+T2               J2               J3               400        0.013      0          0          0          0
+T3               J3               J4               400        0.013      0          0          0          0
+T4               J4               J5               400        0.013      0          0          0          0
+T5               J5               J6               400        0.013      0          0          0          0
+T6               J6               O1               400        0.013      0          0          0          0
+CA1              A1               A2               300        0.013      0          1.5        0          0
+CA2              A2               A3               300        0.013      0          1.5        0          0
+CA3              A3               J3               300        0.013      0.5        1.5        0          0
+CB1              B1               B2               300        0.013      0          0          0          0
+CB2              B2               B3               300        0.013      0          0          0          0
+CB3              B3               J5               400        0.013      0          4.0        0          0
+CC1              C1               C2               300        0.013      0          0          0          0
+CC2              C2               J2               300        0.013      0          3.0        0          0
+CD1              D1               D2               300        0.013      0          0          0          0
+CD2              D2               O2               300        0.013      0          0.5        0          0
+CE1              E1               O3               300        0.013      0          0          0          0
+CG1              G1               G2               200        0.013      1.0        0          0          0
+CG2              G2               O4               300        0.013      0          0          0          0
+CG3              G1               O5               300        0.013      0          0          0          0
+
+[XSECTIONS]
+;;Link           Shape        Geom1            Geom2      Geom3      Geom4      Barrels    Culvert
+T1               CIRCULAR     2.0              0          0          0          1
+T2               CIRCULAR     2.0              0          0          0          1
+T3               RECT_CLOSED  2.0              3.0        0          0          1
+T4               RECT_CLOSED  2.0              3.0        0          0          1
+T5               CIRCULAR     2.5              0          0          0          1
+T6               CIRCULAR     2.5              0          0          0          1
+CA1              CIRCULAR     1.5              0          0          0          1
+CA2              CIRCULAR     1.5              0          0          0          1
+CA3              RECT_CLOSED  1.5              2.0        0          0          1
+CB1              CIRCULAR     1.5              0          0          0          1
+CB2              CIRCULAR     1.0              0          0          0          1
+CB3              RECT_CLOSED  1.5              2.0        0          0          1
+CC1              CIRCULAR     1.0              0          0          0          1
+CC2              CIRCULAR     1.0              0          0          0          1
+CD1              CIRCULAR     1.25             0          0          0          1
+CD2              RECT_CLOSED  1.0              1.5        0          0          1
+CE1              CIRCULAR     1.0              0          0          0          1
+CG1              CIRCULAR     1.0              0          0          0          1
+CG2              CIRCULAR     0.5              0          0          0          1
+CG3              CIRCULAR     0.5              0          0          0          1
+
+[INFLOWS]
+;;Node           Constituent      Time Series      Type     Mfactor  Sfactor  Baseline Pattern
+J1               FLOW             HYD_TRUNK        FLOW     1.0      1.0
+A1               FLOW             HYD_A            FLOW     1.0      1.0
+B1               FLOW             HYD_B            FLOW     1.0      1.0
+D1               FLOW             HYD_D            FLOW     1.0      1.0
+E1               FLOW             HYD_E            FLOW     1.0      1.0
+G2               FLOW             HYD_G            FLOW     1.0      1.0
+
+[TIMESERIES]
+;;Name           Date       Time       Value
+HYD_TRUNK                   0:00       0
+HYD_TRUNK                   0:30       2
+HYD_TRUNK                   1:00       8
+HYD_TRUNK                   1:30       10
+HYD_TRUNK                   2:00       6
+HYD_TRUNK                   3:00       1
+HYD_TRUNK                   3:30       0
+HYD_A                       0:00       0
+HYD_A                       0:45       1.5
+HYD_A                       1:15       6
+HYD_A                       2:00       3
+HYD_A                       3:00       0
+HYD_B                       0:00       0
+HYD_B                       0:30       4
+HYD_B                       1:00       12
+HYD_B                       1:45       12
+HYD_B                       2:30       3
+HYD_B                       3:15       0
+HYD_D                       0:00       0
+HYD_D                       1:00       2
+HYD_D                       2:30       0
+HYD_E                       0:00       0
+HYD_E                       1:00       1
+HYD_E                       2:30       0
+HYD_G                       0:00       0
+HYD_G                       0:45       3
+HYD_G                       2:00       3
+HYD_G                       3:00       0
+
+[REPORT]
+;;Reporting Options
+INPUT      NO
+CONTROLS   NO
+SUBCATCHMENTS NONE
+NODES NONE
+LINKS NONE
