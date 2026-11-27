@@ -1389,6 +1389,14 @@ target_compile_definitions(test_engine_fv_integration PRIVATE
     OPENSWMM_FV_UNIT_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
     OPENSWMM_FV_TEST_OUT_DIR="${PROJECT_SOURCE_DIR}/tests/output")
 
+# [OPTIONS] DW_BACKEND for FLOW_ROUTING DYNWAVE: tokens, default, options API, round trip,
+# OPENSWMM_DW_BACKEND override, the one fallback warning and byte-identical results.
+add_gtest_unit(test_dw_backend_option test_dw_backend_option.cpp)
+target_compile_definitions(test_dw_backend_option PRIVATE
+    OPENSWMM_DW_TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/regression/data"
+    OPENSWMM_DW_UNIT_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
+    OPENSWMM_DW_TEST_OUT_DIR="${PROJECT_SOURCE_DIR}/tests/output")
+
 # Thread-capability query + THREADS resolution rules
 # (THREAD_LIMITS_AND_OVERSUBSCRIPTION_PLAN_2026-09-03): explicit THREADS is
 # honoured above the hardware limit with a warning, size gates still apply,
