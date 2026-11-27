@@ -21,6 +21,7 @@
 #include "FvDeviceMarcher.hpp"
 #include "FvOptions.hpp"
 #include "INetworkSolver.hpp"
+#include "../dw/DwDeviceMarcher.hpp"
 #include "../../2d/solver/GpuPluginAbi.h"
 #include "../../core/ThreadInfo.hpp"
 
@@ -217,6 +218,21 @@ using MakeFn = void* (*)(const OpenSwmmGpuProbe*);
 using DestroyFn = void (*)(void*);
 using ContractFn = const char* (*)();
 
+/// The factory pair a caller needs from a plugin module.
+struct Factory {
+    const char* make;    ///< creating entry point
+    const char* destroy; ///< destroying entry point
+};
+
+/// The 2D surface solver factory.
+constexpr Factory kSurfaceFactory{"openswmm_make_gpu_explicit_solver",
+                                  "openswmm_destroy_gpu_explicit_solver"};
+/// The 1D finite volume substep marcher factory.
+constexpr Factory kNetworkFactory{"openswmm_make_gpu_network_marcher",
+                                  "openswmm_destroy_gpu_network_marcher"};
+/// The dynamic wave Picard loop factory.
+constexpr Factory kDwFactory{"openswmm_make_gpu_dw_marcher", "openswmm_destroy_gpu_dw_marcher"};
+
 /// One usable plugin module for a backend, or why there is none.
 struct Located {
     void* handle = nullptr;
@@ -234,11 +250,10 @@ struct Located {
  * that is present but unusable is not reported as missing.
  *
  * @param[in] backend "omp", "cuda", "hip" or "sycl".
- * @param[in] surface True to require the 2D surface solver factory, false for the 1D network
- *     marcher factory.
+ * @param[in] factory The factory symbols the caller needs.
  * @return The module handle and its probe record, or a null handle and the reason.
  */
-Located locate_plugin(const std::string& backend, bool surface) {
+Located locate_plugin(const std::string& backend, const Factory& factory) {
     Located out;
     out.reason = "the " + backend + " plugin is not installed";
     const int expected_vendor = backend == "omp"    ? OPENSWMM_GPU_VENDOR_OPENMP
@@ -273,11 +288,8 @@ Located locate_plugin(const std::string& backend, bool surface) {
                 continue;
             }
             auto probe = reinterpret_cast<ProbeFn>(platform_sym(h, "openswmm_gpu_probe"));
-            const bool factories = surface
-                                       ? (platform_sym(h, "openswmm_make_gpu_explicit_solver") &&
-                                          platform_sym(h, "openswmm_destroy_gpu_explicit_solver"))
-                                       : (platform_sym(h, "openswmm_make_gpu_network_marcher") &&
-                                          platform_sym(h, "openswmm_destroy_gpu_network_marcher"));
+            const bool factories =
+                platform_sym(h, factory.make) && platform_sym(h, factory.destroy);
             if (!probe || !factories) {
                 out.reason = "the " + backend + " plugin does not provide this solver";
                 continue;
@@ -321,7 +333,7 @@ Located locate_plugin(const std::string& backend, bool surface) {
  */
 std::shared_ptr<IFvDeviceMarcher> try_plugin(const std::string& backend, int requested_threads,
                                              std::string* label, std::string* reason) {
-    Located found = locate_plugin(backend == "metal" ? "omp" : backend, false);
+    Located found = locate_plugin(backend == "metal" ? "omp" : backend, kNetworkFactory);
     if (!found.handle) {
         if (reason)
             *reason = found.reason;
@@ -397,7 +409,7 @@ BackendProbe probeBackend(const std::string& backend_in, bool surface) {
         return out;
     }
     if (backend == "metal") {
-        auto found = locate_plugin("omp", surface);
+        auto found = locate_plugin("omp", surface ? kSurfaceFactory : kNetworkFactory);
         if (!found.handle) {
             out.reason = found.reason;
             return out;
@@ -420,7 +432,7 @@ BackendProbe probeBackend(const std::string& backend_in, bool surface) {
         out.reason = "'" + backend_in + "' is not a backend name";
         return out;
     }
-    const Located found = locate_plugin(backend, surface);
+    const Located found = locate_plugin(backend, surface ? kSurfaceFactory : kNetworkFactory);
     out.usable = found.handle != nullptr;
     out.reason = found.reason;
     if (out.usable) {
@@ -466,6 +478,47 @@ std::unique_ptr<INetworkSolver> makeNetworkSolver(const FvOptions& opts, std::st
                      mode.c_str(), reason.c_str());
     }
     return solver;
+}
+
+std::shared_ptr<dynwave::IDwDeviceMarcher> makeDwDeviceMarcher(const std::string& backend_in,
+                                                               int requested_threads,
+                                                               std::string* label,
+                                                               std::string* reason) {
+    const std::string backend = lower(backend_in);
+    if (backend != "omp" && backend != "cuda" && backend != "hip" && backend != "sycl") {
+        if (reason)
+            *reason = "'" + backend_in + "' is not a device backend";
+        return nullptr;
+    }
+    Located found = locate_plugin(backend, kDwFactory);
+    if (!found.handle) {
+        if (reason)
+            *reason = found.reason;
+        return nullptr;
+    }
+    auto make = reinterpret_cast<MakeFn>(platform_sym(found.handle, kDwFactory.make));
+    auto destroy = reinterpret_cast<DestroyFn>(platform_sym(found.handle, kDwFactory.destroy));
+    if (found.info.vendor == OPENSWMM_GPU_VENDOR_OPENMP)
+        found.info.requested_threads =
+            requested_threads > 0 ? requested_threads : threadinfo::perfCores();
+    void* raw = make(&found.info);
+    if (!raw) {
+        if (reason) {
+            using Error = const char* (*)();
+            auto error =
+                reinterpret_cast<Error>(platform_sym(found.handle, "openswmm_gpu_last_error"));
+            const char* diagnostic = error ? error() : nullptr;
+            *reason = diagnostic && *diagnostic
+                          ? diagnostic
+                          : "the " + backend + " plugin could not create the solver";
+        }
+        return nullptr;
+    }
+    if (label)
+        *label = backend + " (" + found.info.device_name + ")";
+    return std::shared_ptr<dynwave::IDwDeviceMarcher>(
+        static_cast<dynwave::IDwDeviceMarcher*>(raw),
+        [destroy](dynwave::IDwDeviceMarcher* m) { destroy(static_cast<void*>(m)); });
 }
 
 } // namespace openswmm::fv

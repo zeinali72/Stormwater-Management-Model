@@ -218,6 +218,11 @@ extern "C" OPENSWMM_GPU_ABI void* openswmm_make_gpu_network_marcher(const OpenSw
         [&] { ensureKokkosInitialized(probe ? probe->requested_threads : 0); });
 }
 
+extern "C" OPENSWMM_GPU_ABI void* openswmm_make_gpu_dw_marcher(const OpenSwmmGpuProbe* probe) {
+    return openswmm::twoD::gpu::plugin::makeDwMarcher(
+        [&] { ensureKokkosInitialized(probe ? probe->requested_threads : 0); });
+}
+
 #ifdef OPENSWMM_ENABLE_METAL_FACES
 extern "C" OPENSWMM_GPU_ABI int openswmm_probe_metal_faces(char* name, size_t size) {
     try {

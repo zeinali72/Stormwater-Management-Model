@@ -14,6 +14,8 @@
 #include "ExplicitKokkosSurfaceSolver.hpp"
 #include "../../hydraulics/fv/FvDeviceMarcher.hpp"
 #include "../../hydraulics/fv/gpu/KokkosNetworkMarcher.hpp"
+#include "../../hydraulics/dw/DwDeviceMarcher.hpp"
+#include "../../hydraulics/dw/gpu/KokkosDwMarcher.hpp"
 #include <cstdio>
 #include <exception>
 
@@ -66,6 +68,26 @@ void* makeNetworkMarcher(Initialize initialize, bool metal = false) noexcept {
     }
     return nullptr;
 }
+
+/**
+ * @brief Create the dynamic wave Picard loop after the backend runtime is initialized.
+ *
+ * @param[in] initialize Callable that initializes the backend's Kokkos runtime; may throw.
+ * @return Owning openswmm::dynwave::IDwDeviceMarcher* as void*, or nullptr with `error` set.
+ */
+template <class Initialize> void* makeDwMarcher(Initialize initialize) noexcept {
+    error[0] = '\0';
+    try {
+        initialize();
+        return static_cast<openswmm::dynwave::IDwDeviceMarcher*>(
+            openswmm::dynwave::gpu::makeKokkosDwMarcher());
+    } catch (const std::exception& e) {
+        std::snprintf(error, sizeof error, "%s", e.what());
+    } catch (...) {
+        std::snprintf(error, sizeof error, "Unknown plugin initialization failure");
+    }
+    return nullptr;
+}
 }
 extern "C" OPENSWMM_GPU_ABI const char* openswmm_gpu_build_contract() {
     return OPENSWMM_GPU_BUILD_CONTRACT;
@@ -79,4 +101,8 @@ extern "C" OPENSWMM_GPU_ABI void openswmm_destroy_gpu_explicit_solver(void* solv
 
 extern "C" OPENSWMM_GPU_ABI void openswmm_destroy_gpu_network_marcher(void* marcher) {
     delete static_cast<openswmm::fv::IFvDeviceMarcher*>(marcher);
+}
+
+extern "C" OPENSWMM_GPU_ABI void openswmm_destroy_gpu_dw_marcher(void* marcher) {
+    delete static_cast<openswmm::dynwave::IDwDeviceMarcher*>(marcher);
 }

@@ -40,6 +40,10 @@
 #include <memory>
 #include <string>
 
+namespace openswmm::dynwave {
+class IDwDeviceMarcher;
+}
+
 namespace openswmm::fv {
 
 class INetworkSolver;
@@ -87,6 +91,24 @@ struct BackendProbe {
  * @return The probe result; `reason` is empty when usable.
  */
 BackendProbe probeBackend(const std::string& backend, bool surface);
+
+/**
+ * @brief Create the dynamic wave Picard loop of the first usable plugin for a device backend.
+ *
+ * Same discovery, build-contract, ABI and device checks as the network solver's plugins. A host
+ * (OpenMP) plugin is told the thread count to initialize with. Module handles stay loaded for the
+ * process lifetime, so the returned deleter stays valid.
+ *
+ * @param[in] backend "omp", "cuda", "hip" or "sycl", in any case.
+ * @param[in] requested_threads Raw [OPTIONS] THREADS (0 = automatic).
+ * @param[out] label Optional; receives "<backend> (<device name>)" on success.
+ * @param[out] reason Optional; receives why no marcher was created.
+ * @return Shared marcher released through its plugin, or null.
+ */
+std::shared_ptr<dynwave::IDwDeviceMarcher> makeDwDeviceMarcher(const std::string& backend,
+                                                               int requested_threads,
+                                                               std::string* label,
+                                                               std::string* reason);
 
 } // namespace openswmm::fv
 
