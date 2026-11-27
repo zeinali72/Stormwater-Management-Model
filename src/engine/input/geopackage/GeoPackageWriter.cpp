@@ -403,6 +403,7 @@ static void write_options(sqlite3* db, const SimulationContext& ctx, const std::
     for (const auto& [key, value] : fvOptionRows(opts))
         if (key != "FV_PRESSURE_CLOSURE")
             insert(key, value);
+    insert("DW_BACKEND", dwBackendToken(opts.dw_backend)); // [OPTIONS] token, like FV_BACKEND
     insert("REPORT_SIGNED_HEADS", std::to_string(opts.report_signed_heads)); // issue #156
     insert_d("TPA_CELERITY", opts.tpa_celerity);                             // issue #156
     if (opts.surcharge_method == 2) {

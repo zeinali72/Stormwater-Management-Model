@@ -257,6 +257,8 @@ static const std::unordered_map<int, const char*>& warning_table() {
               "below the cap-implied value have no effect there."},
         {109, "undefined object %s in the [REPORT] section was ignored."},
         {110, "land use coverages of Subcatchment %s add to more than 100 percent."},
+        {111, "DW_BACKEND %s has no device dynamic wave solver in this version; the CPU "
+              "solver runs."},
     };
     return table;
 }
