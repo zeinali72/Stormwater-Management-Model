@@ -45,6 +45,7 @@
 #include "Constants.hpp"
 #include "FilePathPair.hpp"
 #include <string>
+#include <string_view>
 #include <vector>
 #include <unordered_map>
 
@@ -546,6 +547,16 @@ struct SimulationOptions {
      */
     bool anderson_accel = false;
 
+    /** @brief Where FLOW_ROUTING DYNWAVE runs ([OPTIONS] DW_BACKEND).
+     *  @details The FV_BACKEND tokens without METAL. Every value runs the CPU solver in this
+     *           version; OMP, CUDA, HIP and SYCL add one warning saying so. The
+     *           OPENSWMM_DW_BACKEND environment variable overrides the key at run time.
+     *  @code
+     *  DW_BACKEND  AUTO   ;; CPU / AUTO (default) / OMP / CUDA / HIP / SYCL
+     *  @endcode
+     */
+    fv::Backend dw_backend = fv::Backend::AUTO;
+
     /** @brief Normal flow limitation: 0=SLOPE, 1=FROUDE, 2=BOTH, 3=NEITHER.
      *  @see Legacy: NormalFlowLtd */
     int normal_flow_ltd = 2; // BOTH (legacy default)
@@ -872,6 +883,46 @@ struct SimulationOptions {
                1000.0;
     }
 };
+
+/**
+ * @brief The [OPTIONS] token of a DW_BACKEND value.
+ *
+ * @param[in] b Backend; METAL, which DW_BACKEND does not accept, reads as AUTO.
+ * @return Upper-case token: CPU, AUTO, OMP, CUDA, HIP or SYCL.
+ */
+inline const char* dwBackendToken(fv::Backend b) {
+    switch (b) {
+    case fv::Backend::CPU:
+        return "CPU";
+    case fv::Backend::OMP:
+        return "OMP";
+    case fv::Backend::CUDA:
+        return "CUDA";
+    case fv::Backend::HIP:
+        return "HIP";
+    case fv::Backend::SYCL:
+        return "SYCL";
+    default:
+        return "AUTO";
+    }
+}
+
+/**
+ * @brief Read a DW_BACKEND token.
+ *
+ * @param[in] token Token, already in upper case.
+ * @param[out] b Set when @p token is CPU, AUTO, OMP, CUDA, HIP or SYCL; unchanged otherwise.
+ * @return False for any other token, METAL included.
+ */
+inline bool parseDwBackend(std::string_view token, fv::Backend& b) {
+    for (fv::Backend v : {fv::Backend::CPU, fv::Backend::AUTO, fv::Backend::OMP, fv::Backend::CUDA,
+                          fv::Backend::HIP, fv::Backend::SYCL})
+        if (token == dwBackendToken(v)) {
+            b = v;
+            return true;
+        }
+    return false;
+}
 
 } /* namespace openswmm */
 

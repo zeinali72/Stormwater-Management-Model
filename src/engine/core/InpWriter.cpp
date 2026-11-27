@@ -2215,6 +2215,8 @@ int writeInpFile(const SimulationContext& ctx_internal, const std::string& path,
             std::fprintf(f, "%-20s %s\n", "NODE_CONTINUITY", "SEMI_IMPLICIT");
         if (o.anderson_accel && !swmm5)
             std::fprintf(f, "%-20s %s\n", "ANDERSON_ACCEL", "YES");
+        if (!swmm5) // written at its default too, as FV_BACKEND is
+            std::fprintf(f, "%-20s %s\n", "DW_BACKEND", dwBackendToken(o.dw_backend));
         // VIRTUAL_JUNCTION_MOMENTUM is not emitted: FULL is retired (see
         // SimulationOptions.hpp) and virtual_junction_momentum is now always 0,
         // so writing the key could only ever re-emit the retired value.

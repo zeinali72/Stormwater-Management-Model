@@ -1172,6 +1172,7 @@ const char* const kStandardOptionKeys[] = {
     "NORMAL_FLOW_LIMITED",
     "INERTIAL_DAMPING",
     "ANDERSON_ACCEL",
+    "DW_BACKEND",
     "DPS_CELERITY",
     "DPS_ALPHA",
     "DPS_DECAY_TIME",
@@ -1521,6 +1522,8 @@ SWMM_ENGINE_API int swmm_options_get(SWMM_Engine engine, const char* key, char* 
         }
     } else if (k == "ANDERSON_ACCEL")
         val = opt.anderson_accel ? "YES" : "NO";
+    else if (k == "DW_BACKEND")
+        val = openswmm::dwBackendToken(opt.dw_backend);
     else if (k == "DPS_CELERITY")
         val = fmt_full(opt.dps_target_celerity);
     else if (k == "DPS_ALPHA")
@@ -2282,6 +2285,9 @@ SWMM_ENGINE_API int swmm_options_set(SWMM_Engine engine, const char* key, const 
             else if (vu == "METAL")
                 opt.fv.backend = openswmm::fv::Backend::METAL;
             else
+                return SWMM_ERR_BADPARAM;
+        } else if (k == "DW_BACKEND") {
+            if (!openswmm::parseDwBackend(upper_copy(v), opt.dw_backend))
                 return SWMM_ERR_BADPARAM;
         }
 
