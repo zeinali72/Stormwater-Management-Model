@@ -55,6 +55,8 @@
  */
 
 #include "DynamicWave.hpp"
+#include "dw/DwDeviceMarcher.hpp"
+#include "dw/DwKernels.hpp"
 #include "SurfaceExchange.hpp"
 #include "Node.hpp"
 #include "Outfall.hpp"
@@ -66,6 +68,7 @@
 #include "AquiferLinkExchange.hpp"      // G-X4
 #include "../2d/coupling/PondModel.hpp" // coupled-junction pond area
 #include "../core/Constants.hpp"
+#include "../core/ErrorCodes.hpp"
 #include "../core/SimulationContext.hpp"
 #include "../core/UnitConversion.hpp"
 #include "../core/ThreadInfo.hpp"
@@ -73,6 +76,7 @@
 
 #include <cmath>
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -1551,8 +1555,11 @@ int DWSolver::execute(SimulationContext& ctx, double dt,
     bool converged_final = false;
     int unconv_shared = 0; // shared team tally (see updateNodeDepthsTeam)
     const bool has_nc = static_cast<bool>(non_conduit_fn);
+    // A device marcher runs the loop below in its place (executeOnDevice); the region is then
+    // inactive and its loop runs no iteration.
+    const bool on_device = device_ && deviceStepAllowed(ctx);
 
-#pragma omp parallel num_threads(num_threads_) if (num_threads_ > 1) default(shared)
+#pragma omp parallel num_threads(num_threads_) if (num_threads_ > 1 && !on_device) default(shared)
     {
 #if defined(__APPLE__)
         // One-time per pool thread (thread_local latch inside): QoS pin to
@@ -1564,7 +1571,7 @@ int DWSolver::execute(SimulationContext& ctx, double dt,
         int t_steps = 0;          // per-thread replica of legacy `Steps`
         bool t_converged = false; // per-thread replica of `converged`
 
-        while (t_steps < max_trials) {
+        while (!on_device && t_steps < max_trials) {
             // Step 0: init node states (team `omp for nowait` — overlaps with
             // geometry STEP A, which touches none of its outputs).
             initNodeStates(ctx);
@@ -1692,6 +1699,9 @@ int DWSolver::execute(SimulationContext& ctx, double dt,
             converged_final = t_converged;
         }
     } // end persistent parallel region (implicit barrier)
+
+    if (on_device)
+        steps_final = executeOnDevice(ctx, dt, non_conduit_fn, converged_final);
 
     steps = steps_final;
     converged = converged_final;
@@ -5229,6 +5239,263 @@ void DWSolver::accumulateLinkStepStats(SimulationContext& ctx, double dt, double
             continue;
         L.add_lstep_sample(j, std::min(t * cf, fixed_step), dt, fixed_step);
     }
+}
+
+// ============================================================================
+// Device Picard loop (DwDeviceMarcher.hpp)
+// ============================================================================
+
+std::string DWSolver::deviceScope(const SimulationContext& ctx) const {
+    if (surcharge_method != SurchargeMethod::EXTRAN && surcharge_method != SurchargeMethod::SLOT)
+        return "SURCHARGE_METHOD is not EXTRAN or SLOT";
+    if (node_continuity != NodeContinuity::EXPLICIT)
+        return "NODE_CONTINUITY is not EXPLICIT";
+    if (anderson_accel)
+        return "Anderson acceleration";
+    if (unsteady_friction != 0)
+        return "unsteady friction";
+
+    const auto& nodes = ctx.nodes;
+    for (int i = 0; i < n_nodes_; ++i) {
+        const auto ui = static_cast<std::size_t>(i);
+        const std::string name = ctx.node_names.name_of(i);
+        const NodeType type = nodes.type[ui];
+        if (type != NodeType::JUNCTION && type != NodeType::OUTFALL)
+            return "node " + name + " is not a junction or outfall";
+        if (ui < nodes.is_virtual.size() && nodes.is_virtual[ui])
+            return "virtual junction " + name;
+        if (ui < nodes.is_inlet.size() && nodes.is_inlet[ui])
+            return "inlet junction " + name;
+        if (ctx.node_subtypes.storage_row(i) >= 0)
+            return "node " + name + " has a storage row";
+        if (nodes.storage_area[ui] > 0.0)
+            return "junction " + name + " has a chamber area";
+        if (ui < ctx.coupled_node.size() && ctx.coupled_node[ui])
+            return "2D-coupled node " + name;
+        const int row = ctx.node_subtypes.outfall_row(i);
+        if (type == NodeType::OUTFALL && row >= 0) {
+            const OutfallType bc =
+                ctx.node_subtypes.outfalls.bc_type[static_cast<std::size_t>(row)];
+            if (bc != OutfallType::FREE && bc != OutfallType::NORMAL && bc != OutfallType::FIXED)
+                return "outfall " + name + " is not FREE, NORMAL or FIXED";
+        }
+    }
+    if (ctx.inlet_usages.count() > 0)
+        return "street inlets";
+    if (!ctx.surface_outfall_link_limit.empty())
+        return "2D surface outfall coupling";
+
+    const auto& links = ctx.links;
+    const auto& CD = ctx.link_subtypes.conduits;
+    for (int j = 0; j < n_links_; ++j) {
+        const auto uj = static_cast<std::size_t>(j);
+        const std::string name = ctx.link_names.name_of(j);
+        if (links.type[uj] != LinkType::CONDUIT)
+            return "link " + name + " is not a conduit";
+        const XsectShape shape = links.xsect_shape[uj];
+        if (shape != XsectShape::CIRCULAR && shape != XsectShape::RECT_CLOSED)
+            return "conduit " + name + " is not CIRCULAR or RECT_CLOSED";
+        const int row = ctx.link_subtypes.conduit_row(j);
+        if (row < 0)
+            return "conduit " + name + " has no conduit row";
+        const auto ur = static_cast<std::size_t>(row);
+        if (CD.barrels[ur] != 1)
+            return "conduit " + name + " has more than one barrel";
+        if (CD.culvert_code[ur] != 0)
+            return "conduit " + name + " is a culvert";
+        if (CD.seep_rate[ur] != 0.0)
+            return "conduit " + name + " seeps";
+        if (ur < CD.gw_coupled.size() && CD.gw_coupled[ur])
+            return "conduit " + name + " is aquifer-coupled";
+    }
+    if (n_conduits_ == 0)
+        return "a network with no conduits";
+    // The device arrays are indexed by conduit; with every link a conduit, conduit c must be link
+    // c and ConduitData row c, so the solver's link arrays serve as conduit arrays as they are.
+    for (int ci = 0; ci < n_conduits_; ++ci) {
+        const auto uci = static_cast<std::size_t>(ci);
+        if (tile_uj_[uci] != ci || tile_crow_[uci] != ci)
+            return "conduit rows out of link order";
+    }
+    return {};
+}
+
+step::Arrays DWSolver::deviceArrays(SimulationContext& ctx) {
+    step::Arrays A;
+    A.n_nodes = n_nodes_;
+    A.n_conduits = n_conduits_;
+    A.surcharge_method = static_cast<int>(surcharge_method);
+
+    A.node_invert = ctx.nodes.invert_elev.data();
+    A.node_is_outfall = device_node_is_outfall_.data();
+
+    A.conduit_link = tile_uj_.data();
+    A.conduit_n1 = tile_n1_.data();
+    A.conduit_n2 = tile_n2_.data();
+    A.conduit_shape = tile_xsect_batch_shape_.data();
+    A.conduit_has_offset = tile_has_offset_.data();
+    A.conduit_offset1 = tile_z1_off_.data();
+    A.conduit_offset2 = tile_z2_off_.data();
+    A.conduit_y_full = tile_y_full_.data();
+    A.conduit_a_full = tile_a_full_.data();
+    A.conduit_r_full = tile_r_full_.data();
+    A.conduit_w_max = tile_w_max_.data();
+    A.conduit_s_full = ctx.links.xsect_s_full.data();
+    A.conduit_s_max = ctx.links.xsect_s_max.data();
+    A.conduit_length = tile_length_.data();
+    A.conduit_beta = tile_beta_.data();
+    A.conduit_q_max = tile_q_max_.data();
+
+    A.node_depth = ctx.nodes.depth.data();
+    A.conduit_q1 = q1_.data();
+    A.conduit_bypassed = bypassed_.data();
+
+    A.depth1 = depth1_.data();
+    A.depth2 = depth2_.data();
+    A.depth_mid = depth_mid_.data();
+    A.h1 = h1_.data();
+    A.h2 = h2_.data();
+    A.fasnh = fasnh_.data();
+    A.width1 = width1_.data();
+    A.width2 = width2_.data();
+    A.width_mid = width_mid_.data();
+    A.surf_area1 = surf_area1_.data();
+    A.surf_area2 = surf_area2_.data();
+    A.area1 = area1_.data();
+    A.area2 = area2_.data();
+    A.area_mid = area_mid_.data();
+    A.hrad1 = hrad1_.data();
+    A.hrad_mid = hrad_mid_.data();
+    // FlowClass is an int8_t enumeration, stored as the kernels' codes.
+    A.flow_class = reinterpret_cast<std::int8_t*>(ctx.links.flow_class.data());
+    A.wcap_d1 = wcap_d1_.data();
+    A.wcap_d2 = wcap_d2_.data();
+    A.wcap_dm = wcap_dm_.data();
+
+    A.tables = step::hostTables();
+    return A;
+}
+
+void DWSolver::attachDeviceMarcher(std::shared_ptr<IDwDeviceMarcher> marcher,
+                                   const SimulationContext& ctx) {
+    device_.reset();
+    if (!marcher)
+        return;
+    device_node_is_outfall_.assign(static_cast<std::size_t>(n_nodes_), 0);
+    for (int i = 0; i < n_nodes_; ++i)
+        device_node_is_outfall_[static_cast<std::size_t>(i)] =
+            ctx.nodes.type[static_cast<std::size_t>(i)] == NodeType::OUTFALL ? 1 : 0;
+    DwDeviceNetwork network;
+    network.host = deviceArrays(const_cast<SimulationContext&>(ctx));
+    marcher->bind(network);
+    device_ = std::move(marcher);
+}
+
+bool DWSolver::deviceStepAllowed(SimulationContext& ctx) {
+    const char* why = nullptr;
+    for (std::size_t i = 0; i < ctx.coupled_node.size() && !why; ++i)
+        if (ctx.coupled_node[i])
+            why = "a 2D-coupled node";
+    if (!why && !ctx.surface_outfall_link_limit.empty())
+        why = "2D surface outfall coupling";
+    const auto& ramp = ctx.node_subtypes.outfalls.ramp_2d;
+    for (std::size_t r = 0; r < ramp.size() && !why; ++r)
+        if (ramp[r] > 0.0)
+            why = "a 2D tailwater at an outfall";
+    const auto& f = ctx.forcing;
+    for (std::size_t i = 0; i < f.node_head_boundary_mode.size() && !why; ++i)
+        if (f.node_head_boundary_mode[i] == ForcingMode::OVERRIDE &&
+            ctx.nodes.type[i] == NodeType::OUTFALL)
+            why = "an outfall stage forced through the API";
+    for (std::size_t j = 0; j < f.link_seepage_mode.size() && !why; ++j)
+        if (f.link_seepage_mode[j] != ForcingMode::NONE)
+            why = "conduit seepage forced through the API";
+    const auto& gw = ctx.link_subtypes.conduits.gw_coupled;
+    for (std::size_t r = 0; r < gw.size() && !why; ++r)
+        if (gw[r])
+            why = "an aquifer-coupled conduit";
+    if (!why)
+        return true;
+
+    std::string token = device_->label();
+    for (char& c : token)
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    ctx.warnings.push_back(
+        format_warning(WARN_DW_BACKEND_CPU, token, std::string("(") + why + " during the run)"));
+    device_.reset();
+    return false;
+}
+
+namespace {
+/// What DWSolver::deviceHostStage needs to run a stage of one execute() on the host.
+struct DeviceHostCall {
+    DWSolver* solver;
+    SimulationContext* ctx;
+    double dt;
+    const DWSolver::NonConduitFlowFunc* non_conduit_fn;
+};
+} // namespace
+
+int DWSolver::deviceHostStage(void* user, int stage, int iteration) {
+    auto& call = *static_cast<DeviceHostCall*>(user);
+    DWSolver& s = *call.solver;
+    SimulationContext& ctx = *call.ctx;
+    const double dt = call.dt;
+    const bool has_nc = static_cast<bool>(*call.non_conduit_fn);
+    // The stages of execute()'s loop, run by one thread outside a parallel region. The
+    // surface-outfall and LID-port block after momentumKernels, and the Anderson flags before
+    // the node update, do nothing for a model in deviceScope().
+    switch (stage) {
+    case kDwInitNodes:
+        s.initNodeStates(ctx);
+        return 0;
+    case kDwGeometry:
+        s.computeLinkGeometry(ctx);
+        return 0;
+    case kDwMomentum:
+        s.momentumKernels(ctx, dt, iteration);
+        return 0;
+    case kDwGather:
+        if (has_nc)
+            s.gatherConduitNodeFlows(ctx);
+        else
+            s.updateNodeFlows(ctx);
+        return 0;
+    case kDwBoundary:
+        if (has_nc)
+            (*call.non_conduit_fn)(ctx, dt, iteration);
+        if (!s.losses_all_zero_)
+            s.limitConduitLosses(ctx, dt);
+        openswmm::outfall::setAllOutfallDepths(ctx, dt);
+        return 0;
+    case kDwNodeDepths: {
+        int unconverged = 0;
+        s.updateNodeDepthsTeam(ctx, dt, iteration, unconverged);
+        return unconverged;
+    }
+    case kDwBypass:
+        s.findBypassedLinks(ctx);
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+int DWSolver::executeOnDevice(SimulationContext& ctx, double dt,
+                              const NonConduitFlowFunc& non_conduit_fn, bool& converged) {
+    DeviceHostCall call{this, &ctx, dt, &non_conduit_fn};
+    DwDeviceStep step;
+    step.dt = dt;
+    step.max_trials = max_trials;
+    step.host = deviceArrays(ctx);
+    step.host_stage = &DWSolver::deviceHostStage;
+    step.user = &call;
+    const DwDeviceResult r = device_->execute(step);
+    if (!r.ok)
+        throw std::runtime_error(std::string("dynamic wave device loop failed: ") +
+                                 (r.error ? r.error : "unknown error"));
+    converged = r.converged;
+    return r.iterations;
 }
 
 } // namespace dynwave
