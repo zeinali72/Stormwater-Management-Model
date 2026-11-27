@@ -48,6 +48,7 @@
 #include "../hydrology/LidNode.hpp"
 
 #include <cmath>
+#include <cctype>
 #include <algorithm>
 #include <fstream>
 #include <iomanip>
