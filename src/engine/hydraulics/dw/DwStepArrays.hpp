@@ -217,7 +217,7 @@ struct Arrays {
     std::uint8_t* normal_flow_limited = nullptr; ///< ConduitData::normal_flow_limited
 
     // ---- shared tables ----------------------------------------------------
-    Tables tables;
+    Tables tables; ///< circular geometry tables and Amax
 };
 
 } // namespace openswmm::dynwave::step
