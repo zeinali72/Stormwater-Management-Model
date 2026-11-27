@@ -421,7 +421,7 @@ DwDeviceResult KokkosDwMarcher::execute(const DwDeviceStep& step) {
         d_.min_surf_area = step.host.min_surf_area;
         d_.allow_ponding = step.host.allow_ponding;
 
-        // DWSolver::execute's loop control (DynamicWave.cpp:1564-1648).
+        // DWSolver::execute's loop control (DynamicWave.cpp:1567-1687).
         int iterations = 0;
         bool converged = false;
         while (iterations < step.max_trials) {

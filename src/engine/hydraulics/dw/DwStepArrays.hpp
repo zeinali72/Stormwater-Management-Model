@@ -86,10 +86,10 @@ struct Arrays {
     int surcharge_method = kSurchargeExtran; ///< kSurchargeExtran or kSurchargeSlot
 
     // ---- options (read at every routing step) -------------------------------
-    double omega = 0.0;       ///< DWSolver::omega, the Picard under-relaxation weight
-    int normal_flow_ltd = 0;  ///< SimulationOptions::normal_flow_ltd
-    int inertial_damping = 0; ///< SimulationOptions::inertial_damping
-    double head_tol = 0.0;    ///< DWSolver::head_tol, the node convergence tolerance, ft
+    double omega = 0.0;         ///< DWSolver::omega, the Picard under-relaxation weight
+    int normal_flow_ltd = 0;    ///< SimulationOptions::normal_flow_ltd
+    int inertial_damping = 0;   ///< SimulationOptions::inertial_damping
+    double head_tol = 0.0;      ///< DWSolver::head_tol, the node convergence tolerance, ft
     double min_surf_area = 0.0; ///< DWSolver::min_surf_area_, ft2
     int allow_ponding = 0;      ///< SimulationOptions::allow_ponding
 
@@ -171,8 +171,8 @@ struct Arrays {
     double* node_dydt = nullptr;                ///< DWNodeArrays::dYdT, ft/s
 
     // ---- conduit state read by the geometry stage --------------------------
-    double* conduit_q1 = nullptr;                   ///< last per-barrel flow (DWSolver::q1_), cfs
-    std::uint8_t* conduit_bypassed = nullptr;       ///< both end nodes converged (held this pass)
+    double* conduit_q1 = nullptr;             ///< last per-barrel flow (DWSolver::q1_), cfs
+    std::uint8_t* conduit_bypassed = nullptr; ///< both end nodes converged (held this pass)
 
     // ---- link geometry (written for live conduits, held for bypassed ones) --
     double* depth1 = nullptr;          ///< upstream flow depth, ft
