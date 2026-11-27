@@ -409,6 +409,7 @@ private:
     std::shared_ptr<IDwDeviceMarcher> device_;
     /// OUTFALL flag per node, for the device path's static arrays.
     std::vector<uint8_t> device_node_is_outfall_;
+    std::vector<uint8_t> device_node_outfall_flap_; ///< outfall with a flap gate, by node
 
     /**
      * @brief Point a step::Arrays at this solver's arrays and the context's.

@@ -22,7 +22,8 @@
  * @details These are the bodies of DWSolver (DynamicWave.cpp) for the network the device path
  *          supports: junctions and outfalls (FREE, NORMAL, FIXED), conduits of CIRCULAR or
  *          RECT_CLOSED section with one barrel, SURCHARGE_METHOD EXTRAN or SLOT. This version
- *          holds the link geometry stage, DWSolver::computeLinkGeometry.
+ *          holds the link geometry stage, DWSolver::computeLinkGeometry, and the momentum stage,
+ *          DWSolver::momentumKernels.
  *
  *          Each function keeps the floating-point expressions of the code it mirrors, in the same
  *          order, so the two give the same bits; the mirrored code is named in each comment, with
@@ -81,6 +82,19 @@ inline constexpr std::int8_t kSubcritical = static_cast<std::int8_t>(FlowClass::
 inline constexpr std::int8_t kUpCritical = static_cast<std::int8_t>(FlowClass::UP_CRITICAL);
 /// Critical depth at the downstream end.
 inline constexpr std::int8_t kDnCritical = static_cast<std::int8_t>(FlowClass::DN_CRITICAL);
+/// Subcritical flow the momentum stage found to have a Froude number above one.
+inline constexpr std::int8_t kSupercritical = static_cast<std::int8_t>(FlowClass::SUPERCRITICAL);
+
+// MomentumCategory codes (DynamicWave.hpp), as stored in Arrays::category. DynamicWave.cpp
+// checks they agree.
+/// Dry, empty or closed: zero flow.
+inline constexpr std::uint8_t kSkipDry = 0;
+/// Manning friction, open channel.
+inline constexpr std::uint8_t kManningOpen = 1;
+/// Manning friction, closed conduit with a free surface.
+inline constexpr std::uint8_t kManningClosedFs = 2;
+/// Manning friction, closed conduit full at both ends.
+inline constexpr std::uint8_t kManningClosedFull = 3;
 
 /**
  * @brief Bind the shared geometry tables in host memory.
@@ -1249,6 +1263,400 @@ OPENSWMM_KERNEL_FN void linkGeometry(const Arrays& A, int c) noexcept {
     slotWidthOverride(A, c);
     flowClassSurfArea(A, c);
     geometryAreas(A, c);
+}
+
+// ===========================================================================
+// Momentum (DWSolver::momentumKernels)
+// ===========================================================================
+
+/**
+ * @brief DynamicWave.cpp conveyArea (205): a momentum area without the Preissmann slot.
+ *
+ * @param[in] a Flow area, ft2.
+ * @param[in] a_full Full area, ft2.
+ * @return min(a, a_full).
+ */
+OPENSWMM_KERNEL_FN double conveyArea(double a, double a_full) noexcept {
+    return (a > a_full) ? a_full : a;
+}
+
+/**
+ * @brief DynamicWave.cpp slotArea (217): area of the static slot above the crown at depth y.
+ *
+ * @param[in] y Depth, ft, above y_full.
+ * @param[in] y_full Full depth, ft.
+ * @param[in] w_max Maximum width, ft.
+ * @return Slot area, ft2.
+ */
+OPENSWMM_KERNEL_FN double slotArea(double y, double y_full, double w_max) noexcept {
+    const int n = 8;
+    const double eta = minOf(y / y_full, 1.78);
+    const double dx = (eta - 1.0) / n;
+    double sum = 0.0;
+    for (int i = 0; i <= n; ++i) {
+        const double f = std::exp(-std::pow(1.0 + i * dx, 2.4));
+        if (i == 0 || i == n)
+            sum += f;
+        else if (i % 2 == 1)
+            sum += 4.0 * f;
+        else
+            sum += 2.0 * f;
+    }
+    double a = y_full * w_max * 0.5423 * sum * dx / 3.0;
+    if (y > 1.78 * y_full)
+        a += (y - 1.78 * y_full) * 0.01 * w_max;
+    return a;
+}
+
+/**
+ * @brief hydkernels::froudeNumber (HydClosureKernels.hpp:73), spelled for device code.
+ *
+ * @param[in] velocity Flow velocity, ft/s; the sign is dropped.
+ * @param[in] hyd_depth Hydraulic depth A/W, ft, positive.
+ * @return |v| / sqrt(GRAVITY * hyd_depth), in that order.
+ */
+OPENSWMM_KERNEL_FN double froudeNumber(double velocity, double hyd_depth) noexcept {
+    const double v_abs = (velocity < 0.0) ? -velocity : velocity;
+    return v_abs / std::sqrt(constants::GRAVITY * hyd_depth);
+}
+
+/**
+ * @brief STEP E of DWSolver::momentumKernels (DynamicWave.cpp:2778-2847) for EXTRAN and SLOT:
+ *        full area and hydraulic radius at and above the crown, plus the slot's area and width.
+ *
+ * The TPA slot line of that block is out of scope.
+ *
+ * @param[in] A Step arrays; area1/2/mid, hrad1, hrad_mid and width_mid of conduit c may be
+ *     overwritten.
+ * @param[in] c Live conduit.
+ */
+OPENSWMM_KERNEL_FN void staticSlotAreas(const Arrays& A, int c) noexcept {
+    const double yf = A.conduit_y_full[c];
+    const double af = A.conduit_a_full[c];
+    const double rf = A.conduit_r_full[c];
+    const double wm = A.conduit_w_max[c];
+    const int shape = A.conduit_shape[c];
+    const int sm = A.surcharge_method;
+
+    if (A.depth1[c] >= yf) {
+        A.area1[c] = af;
+        A.hrad1[c] = rf;
+    }
+    if (A.depth2[c] >= yf) {
+        A.area2[c] = af;
+    }
+    if (A.depth_mid[c] >= yf) {
+        A.area_mid[c] = af;
+        A.hrad_mid[c] = rf;
+    }
+
+    if (A.depth1[c] > yf) {
+        const double wSlot = slotWidth(sm, A.depth1[c], yf, wm, shape);
+        A.area1[c] = af + (wSlot > 0.0 ? slotArea(A.depth1[c], yf, wm) : 0.0);
+        A.hrad1[c] = rf;
+    }
+    if (A.depth2[c] > yf) {
+        const double wSlot = slotWidth(sm, A.depth2[c], yf, wm, shape);
+        A.area2[c] = af + (wSlot > 0.0 ? slotArea(A.depth2[c], yf, wm) : 0.0);
+    }
+    const double yMid = A.depth_mid[c];
+    if (yMid > yf) {
+        const double wSlot = slotWidth(sm, yMid, yf, wm, shape);
+        A.area_mid[c] = af + (wSlot > 0.0 ? slotArea(yMid, yf, wm) : 0.0);
+        if (wSlot > 0.0)
+            A.width_mid[c] = wSlot;
+        A.hrad_mid[c] = rf;
+    }
+}
+
+/**
+ * @brief DWSolver::processDryLink (DynamicWave.cpp:2942): zero flow on a dry, empty or closed
+ *        conduit.
+ *
+ * @param[in] A Step arrays.
+ * @param[in] c Live conduit.
+ * @param[in] dt_g Routing step times GRAVITY (DWSolver::dt_gravity_).
+ */
+OPENSWMM_KERNEL_FN void dryLink(const Arrays& A, int c, double dt_g) noexcept {
+    const double aMid = A.area_mid[c];
+    const double barrels_d = A.conduit_barrels[c];
+    A.area_mid[c] = 0.5 * (A.area1[c] + A.area2[c]);
+    A.dqdh[c] = dt_g * aMid / A.conduit_length[c] * barrels_d;
+    A.froude[c] = 0.0;
+    A.new_flow[c] = 0.0;
+    A.conduit_q1[c] = 0.0;
+    const double yf = A.conduit_y_full[c];
+    A.link_depth[c] = minOf(A.depth_mid[c], yf);
+    A.link_volume[c] = A.area_mid[c] * A.conduit_links_length[c] * barrels_d;
+}
+
+/**
+ * @brief DWSolver::applyFlowLimits (DynamicWave.cpp:2979): normal-flow limit, under-relaxation,
+ *        flow limit, flap gates and dry ends, then the new flow, depth, volume and full state.
+ *
+ * The culvert inlet-control branch is out of scope. An in-scope node has no storage row, so
+ * lidnode::portDepth is its depth.
+ *
+ * @param[in] A Step arrays.
+ * @param[in] c Live conduit.
+ * @param[in] step Zero-based Picard iteration.
+ * @param[in] q Per-barrel flow from the momentum equation, cfs.
+ * @param[in] qLast Per-barrel flow of the previous iteration, cfs.
+ * @param[in] barrels_d Barrel count.
+ */
+OPENSWMM_KERNEL_FN void flowLimits(const Arrays& A, int c, int step, double q, double qLast,
+                                   double barrels_d) noexcept {
+    using constants::FUDGE;
+    const double yf = A.conduit_y_full[c];
+    const int n1 = A.conduit_n1[c];
+    const int n2 = A.conduit_n2[c];
+
+    A.inlet_control[c] = 0;
+    A.normal_flow_limited[c] = 0;
+    if (q > 0.0) {
+        const std::int8_t fc2 = A.flow_class[c];
+        const int nfl = A.normal_flow_ltd;
+        if (nfl != 3 && A.depth1[c] < yf && (fc2 == kSubcritical || fc2 == kSupercritical)) {
+            bool hasOutfall = false;
+            if (n1 >= 0 && n2 >= 0)
+                hasOutfall = (A.node_is_outfall[n1] != 0 || A.node_is_outfall[n2] != 0);
+            const bool slope_check =
+                (nfl == 0 || nfl == 2 || hasOutfall) && (A.depth1[c] < A.depth2[c]);
+            bool froude_check = false;
+            if (!slope_check && (nfl == 1 || nfl == 2) && !hasOutfall) {
+                if (A.depth1[c] > FUDGE && A.depth2[c] > FUDGE) {
+                    const double y1d = A.depth1[c];
+                    const bool closed_nearfull =
+                        !shapeIsOpen(A.conduit_shape[c]) && (yf - y1d <= FUDGE);
+                    if (!closed_nearfull) {
+                        const double v1 = q / A.area1[c];
+                        const double w1 = scalarWofY(A.tables, sectionOf(A, c), y1d);
+                        const double dh1 = A.area1[c] / w1;
+                        const double f1 = std::fabs(v1) / std::sqrt(constants::GRAVITY * dh1);
+                        froude_check = (f1 >= 1.0);
+                    }
+                }
+            }
+            if (slope_check || froude_check) {
+                const double qNorm =
+                    A.conduit_beta[c] * A.area1[c] * std::pow(A.hrad1[c], 2.0 / 3.0);
+                if (qNorm < q) {
+                    q = qNorm;
+                    A.normal_flow_limited[c] = 1;
+                }
+            }
+        }
+    }
+
+    if (step > 0) {
+        q = (1.0 - A.omega) * qLast + A.omega * q;
+        if (q * qLast < 0.0)
+            q = 0.001 * ((q > 0.0) ? 1.0 : -1.0);
+    }
+
+    const double q_limit = A.conduit_q_limit[c];
+    if (q_limit > 0.0) {
+        if (std::fabs(q) > q_limit)
+            q = ((q > 0.0) ? 1.0 : -1.0) * q_limit;
+    }
+
+    if (A.conduit_has_flap_gate[c]) {
+        if (q * static_cast<double>(A.conduit_direction[c]) < 0.0)
+            q = 0.0;
+    }
+    if (q < 0.0 && n2 >= 0 && A.node_outfall_flap[n2])
+        q = 0.0;
+    if (q > 0.0 && n1 >= 0 && A.node_outfall_flap[n1])
+        q = 0.0;
+
+    if (q > FUDGE && A.node_depth[n1] <= FUDGE)
+        q = FUDGE;
+    if (q < -FUDGE && A.node_depth[n2] <= FUDGE)
+        q = -FUDGE;
+
+    A.new_flow[c] = q * barrels_d;
+    A.conduit_q1[c] = q;
+
+    A.link_depth[c] = minOf(A.depth_mid[c], yf);
+    const double aMidAvg = (A.area1[c] + A.area2[c]) * 0.5;
+    A.link_volume[c] = aMidAvg * A.conduit_links_length[c] * barrels_d;
+
+    const double a_full = A.conduit_a_full[c];
+    const bool up_full = A.area1[c] >= a_full;
+    const bool dn_full = A.area2[c] >= a_full;
+    const bool mid_full = A.area_mid[c] >= a_full;
+    A.full_state[c] =
+        static_cast<std::int8_t>((up_full ? 1 : 0) | (dn_full ? 2 : 0) | (mid_full ? 4 : 0));
+}
+
+/**
+ * @brief DWSolver::processManningLink (DynamicWave.cpp:3135) for the Manning categories.
+ *
+ * Out of scope and left out: the virtual-junction coupling (its zero term is still added, for
+ * the sign of zero), unsteady friction, and evaporation and seepage, whose rates are zero for a
+ * closed conduit with no seepage (DWSolver::recomputeConduitLossOne). An in-scope conduit is
+ * closed, so the Froude branch never sees a midpoint depth above full, where the CPU
+ * re-evaluates the area.
+ *
+ * @param[in] A Step arrays.
+ * @param[in] c Live conduit.
+ * @param[in] dt Routing step, s.
+ * @param[in] dt_g dt times GRAVITY (DWSolver::dt_gravity_).
+ * @param[in] step Zero-based Picard iteration.
+ * @param[in] cat kManningOpen, kManningClosedFs or kManningClosedFull.
+ */
+OPENSWMM_KERNEL_FN void manningLink(const Arrays& A, int c, double dt, double dt_g, int step,
+                                    std::uint8_t cat) noexcept {
+    using constants::FUDGE;
+    using constants::MAX_VELOCITY;
+    const bool is_closed_full = (cat == kManningClosedFull);
+    const bool is_open_cat = (cat == kManningOpen);
+
+    const double barrels_d = A.conduit_barrels[c];
+    const double length = A.conduit_length[c];
+    const double aMid = A.area_mid[c];
+    const double rMid = A.hrad_mid[c];
+    const double qLast = A.conduit_q1[c];
+    const double yf = A.conduit_y_full[c];
+    const bool isFull = (A.depth1[c] >= yf && A.depth2[c] >= yf);
+
+    const double aFull = A.conduit_a_full[c];
+    const double a1Conv = conveyArea(A.area1[c], aFull);
+    const double a2Conv = conveyArea(A.area2[c], aFull);
+    const double aMidConv = conveyArea(aMid, aFull);
+
+    double v = qLast / aMidConv;
+    double absv = std::fabs(v);
+    if (absv > MAX_VELOCITY) {
+        v = (v > 0.0) ? MAX_VELOCITY : -MAX_VELOCITY;
+        absv = MAX_VELOCITY;
+    }
+    A.velocity[c] = v;
+
+    double fr = 0.0;
+    double sig = 0.0;
+    if (!is_closed_full) {
+        double wMid = A.width_mid[c];
+        if (A.flow_class[c] == kSubcritical && A.wcap_dm[c] < A.depth_mid[c])
+            wMid = scalarWofY(A.tables, sectionOf(A, c), A.depth_mid[c]);
+        const bool closed_nearfull =
+            !shapeIsOpen(A.conduit_shape[c]) && (yf - A.depth_mid[c] <= FUDGE);
+        if (A.depth_mid[c] > FUDGE && !closed_nearfull) {
+            const double aFr = aMid;
+            const double dh = (wMid > 0.0) ? aFr / wMid : 0.0;
+            fr = (dh > 0.0) ? froudeNumber(absv, dh) : 0.0;
+        }
+        if (A.flow_class[c] == kSubcritical && fr > 1.0)
+            A.flow_class[c] = kSupercritical;
+        sig = maxOf(0.0, minOf(1.0, 2.0 * (1.0 - fr)));
+    }
+    A.froude[c] = fr;
+
+    const double h1 = A.h1[c];
+    const double h2 = A.h2[c];
+
+    const double r1_val = A.hrad1[c];
+    double rho = 1.0;
+    if (!is_closed_full && !isFull && qLast > 0.0 && h1 >= h2)
+        rho = sig;
+    const double aWtd = a1Conv + (aMidConv - a1Conv) * rho;
+    const double rWtd = r1_val + (rMid - r1_val) * rho;
+
+    if (!is_closed_full) {
+        if (A.inertial_damping == 0)
+            sig = 1.0;
+        else if (A.inertial_damping == 2)
+            sig = 0.0;
+        if (!is_open_cat && isFull)
+            sig = 0.0;
+    }
+    A.sigma[c] = sig;
+
+    const double r43 = std::pow(rWtd, 1.33333);
+    const double dq1 = dt * A.conduit_rough_factor[c] / r43 * absv;
+    const double dq2 = dt_g * aWtd * (h2 - h1) / length;
+
+    const double aOld = maxOf(conveyArea(A.area_old[c], aFull), FUDGE);
+    double dq3 = 0.0, dq4 = 0.0;
+    if (sig > 0.0) {
+        dq3 = 2.0 * v * (aMidConv - aOld) * sig;
+        if (length > 0.0)
+            dq4 = dt * v * v * (a2Conv - a1Conv) / length * sig;
+        dq4 += 0.0; // the CPU adds the virtual-junction term, zero here
+    }
+
+    double dq5 = 0.0;
+    if (A.conduit_has_losses[c]) {
+        const double absq = std::fabs(qLast);
+        double losses = 0.0;
+        if (a1Conv > FUDGE)
+            losses += A.conduit_loss_inlet[c] * (absq / a1Conv);
+        if (a2Conv > FUDGE)
+            losses += A.conduit_loss_outlet[c] * (absq / a2Conv);
+        if (aMidConv > FUDGE)
+            losses += A.conduit_loss_avg[c] * (absq / aMidConv);
+        dq5 = losses / 2.0 / length * dt;
+    }
+
+    const double dq6 = 0.0;
+
+    const double qOld = A.conduit_old_flow[c] / barrels_d;
+    const double denom = 1.0 + dq1 + dq5;
+    const double q = (qOld - dq2 + dq3 + dq4 + dq6) / denom;
+    A.dqdh[c] = 1.0 / denom * constants::GRAVITY * dt * aWtd / length * barrels_d;
+
+    flowLimits(A, c, step, q, qLast, barrels_d);
+}
+
+/**
+ * @brief One conduit of DWSolver::momentumKernels (DynamicWave.cpp:2735-2919, solve_conduit).
+ *
+ * A bypassed conduit keeps its flow and dQ/dH. Out of scope and left out: the loss-rate recompute
+ * (zero for a closed conduit with no seepage), the force-main categories, and the chamber volume
+ * of a node with a storage area.
+ *
+ * @param[in] A Step arrays.
+ * @param[in] c Conduit index in [0, n_conduits).
+ * @param[in] dt Routing step, s.
+ * @param[in] step Zero-based Picard iteration.
+ */
+OPENSWMM_KERNEL_FN void conduitMomentum(const Arrays& A, int c, double dt, int step) noexcept {
+    using constants::FUDGE;
+    A.new_flow[c] = A.link_flow[c];
+    if (A.conduit_bypassed[c])
+        return;
+
+    A.dqdh[c] = 0.0;
+    staticSlotAreas(A, c);
+
+    const std::int8_t fc = A.flow_class[c];
+    const double aMid = A.area_mid[c];
+    const double yf_c = A.conduit_y_full[c];
+    const bool isFull = (A.depth1[c] >= yf_c && A.depth2[c] >= yf_c);
+    const bool is_open = shapeIsOpen(A.conduit_shape[c]);
+
+    std::uint8_t cat;
+    if (fc == kDry || fc == kUpDry || fc == kDnDry || aMid <= FUDGE || A.conduit_is_closed[c] ||
+        A.conduit_setting[c] == 0.0) {
+        cat = kSkipDry;
+    } else if (!is_open && isFull) {
+        cat = kManningClosedFull;
+    } else if (is_open) {
+        cat = kManningOpen;
+    } else {
+        cat = kManningClosedFs;
+    }
+    A.category[c] = cat;
+
+    // DWSolver::execute sets dt_gravity_ the same way.
+    const double dt_g = dt * constants::GRAVITY;
+    if (cat == kSkipDry)
+        dryLink(A, c, dt_g);
+    else
+        manningLink(A, c, dt, dt_g, step, cat);
+
+    A.link_flow[c] = A.new_flow[c];
+    A.link_dqdh[c] = A.dqdh[c];
 }
 
 } // namespace openswmm::dynwave::step

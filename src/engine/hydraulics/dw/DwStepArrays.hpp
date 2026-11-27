@@ -27,8 +27,9 @@
  *          section with one barrel, SURCHARGE_METHOD EXTRAN or SLOT. Every conduit array is
  *          indexed by the conduit's position c in DWSolver's dense conduit tile (0..n_conduits-1),
  *          every node array by the node index. It holds what the link geometry stage
- *          (DWSolver::computeLinkGeometry) reads and writes; the later stages (momentum, node
- *          update, outfall boundaries, time step) add their own fields to the same struct.
+ *          (DWSolver::computeLinkGeometry) and the momentum stage (DWSolver::momentumKernels) read and
+ *          write; the later stages (node update, outfall boundaries, time step) add their own
+ *          fields to the same struct.
  *
  * @see DwKernels.hpp
  * @ingroup engine_hydraulics
@@ -75,9 +76,15 @@ struct Arrays {
     // ---- options (static) -------------------------------------------------
     int surcharge_method = kSurchargeExtran; ///< kSurchargeExtran or kSurchargeSlot
 
+    // ---- options (read at every routing step) -------------------------------
+    double omega = 0.0;       ///< DWSolver::omega, the Picard under-relaxation weight
+    int normal_flow_ltd = 0;  ///< SimulationOptions::normal_flow_ltd
+    int inertial_damping = 0; ///< SimulationOptions::inertial_damping
+
     // ---- nodes (static) ---------------------------------------------------
     const double* node_invert = nullptr;           ///< NodeData::invert_elev, ft
     const std::uint8_t* node_is_outfall = nullptr; ///< 1 for an OUTFALL node
+    const std::uint8_t* node_outfall_flap = nullptr; ///< 1 for an OUTFALL node with a flap gate
 
     // ---- conduits (static) ------------------------------------------------
     const int* conduit_link = nullptr;  ///< global link index of conduit c
@@ -96,12 +103,28 @@ struct Arrays {
     const double* conduit_length = nullptr; ///< modified length (mod_length, else length), ft
     const double* conduit_beta = nullptr;   ///< ConduitData::beta
     const double* conduit_q_max = nullptr;  ///< ConduitData::q_max, per barrel, cfs
+    const double* conduit_links_length = nullptr; ///< routing length (true_length, else length), ft
+    const double* conduit_rough_factor = nullptr; ///< ConduitData::rough_factor
+    const double* conduit_barrels = nullptr;      ///< barrel count as a double
+    const std::uint8_t* conduit_is_closed = nullptr;     ///< LinkData::is_closed at initialization
+    const std::uint8_t* conduit_has_losses = nullptr;    ///< any of the three loss coefficients set
+    const double* conduit_loss_inlet = nullptr;          ///< ConduitData::loss_inlet
+    const double* conduit_loss_outlet = nullptr;         ///< ConduitData::loss_outlet
+    const double* conduit_loss_avg = nullptr;            ///< ConduitData::loss_avg
+    const double* conduit_q_limit = nullptr;             ///< LinkData::q_limit, cfs; 0 for none
+    const std::uint8_t* conduit_has_flap_gate = nullptr; ///< LinkData::has_flap_gate
+    const std::int8_t* conduit_direction = nullptr;      ///< LinkData::direction, +1 or -1
+
+    // ---- conduit inputs of one routing step (read only by the loop) ---------
+    const double* conduit_setting = nullptr;  ///< LinkData::setting; 0 when a rule closed it
+    const double* conduit_old_flow = nullptr; ///< LinkData::old_flow, cfs
+    const double* area_old = nullptr;         ///< midpoint area at the step start, ft2
 
     // ---- node state (one Picard iteration) --------------------------------
     const double* node_depth = nullptr; ///< NodeData::depth, ft
 
     // ---- conduit state read by the geometry stage --------------------------
-    const double* conduit_q1 = nullptr;             ///< last per-barrel flow (DWSolver::q1_), cfs
+    double* conduit_q1 = nullptr;                   ///< last per-barrel flow (DWSolver::q1_), cfs
     const std::uint8_t* conduit_bypassed = nullptr; ///< both end nodes converged (held this pass)
 
     // ---- link geometry (written for live conduits, held for bypassed ones) --
@@ -129,6 +152,22 @@ struct Arrays {
     double* wcap_d1 = nullptr; ///< upstream depth STEP B evaluates the width at, ft
     double* wcap_d2 = nullptr; ///< downstream depth STEP B evaluates the width at, ft
     double* wcap_dm = nullptr; ///< midpoint depth STEP B evaluates the width at, ft
+
+    // ---- momentum (DWSolver::momentumKernels) --------------------------------
+    // Link arrays: in scope, conduit c is link c and ConduitData row c.
+    double* link_flow = nullptr;                 ///< LinkData::flow, cfs
+    double* link_dqdh = nullptr;                 ///< LinkData::dqdh, ft2/s
+    double* link_depth = nullptr;                ///< LinkData::depth, ft
+    double* link_volume = nullptr;               ///< LinkData::volume, ft3
+    double* new_flow = nullptr;                  ///< DWSolver::new_flow_, cfs
+    double* dqdh = nullptr;                      ///< DWSolver::dqdh_, ft2/s
+    double* velocity = nullptr;                  ///< DWSolver::velocity_, ft/s
+    double* froude = nullptr;                    ///< DWSolver::froude_
+    double* sigma = nullptr;                     ///< DWSolver::sigma_, the inertial damping factor
+    std::uint8_t* category = nullptr;            ///< DWSolver::category_ (MomentumCategory)
+    std::int8_t* full_state = nullptr;           ///< ConduitData::full_state bits
+    std::uint8_t* inlet_control = nullptr;       ///< ConduitData::inlet_control
+    std::uint8_t* normal_flow_limited = nullptr; ///< ConduitData::normal_flow_limited
 
     // ---- shared tables ----------------------------------------------------
     Tables tables;

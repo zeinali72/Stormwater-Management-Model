@@ -111,11 +111,13 @@ public:
 
     // Public only for the reason above; not part of the interface.
     void linkGeometry();
+    void momentum(double dt, int iteration);
 
 private:
     template <class T> T* alloc(const char* name, int n);
     template <class T> T* upload(const char* name, const T* host, int n);
     std::vector<Sync> stateOf(const step::Arrays& h) const;
+    std::vector<Sync> inputsOf(const step::Arrays& h) const;
     static void push(const std::vector<Sync>& list);
     static void pull(const std::vector<Sync>& list);
     int onHost(const DwDeviceStep& step, const std::vector<Sync>& state, int stage, int iteration);
@@ -126,6 +128,9 @@ private:
     double* node_depth_ = nullptr;
     double* q1_ = nullptr;
     std::uint8_t* bypassed_ = nullptr;
+    double* setting_ = nullptr;
+    double* old_flow_ = nullptr;
+    double* area_old_ = nullptr;
     long steps_ = 0;
     long host_stages_ = 0;
     std::string error_;
@@ -167,6 +172,7 @@ void KokkosDwMarcher::bind(const DwDeviceNetwork& network) {
 
     d_.node_invert = upload("dw_node_invert", h.node_invert, nn);
     d_.node_is_outfall = upload("dw_node_is_outfall", h.node_is_outfall, nn);
+    d_.node_outfall_flap = upload("dw_node_outfall_flap", h.node_outfall_flap, nn);
 
     d_.conduit_link = upload("dw_conduit_link", h.conduit_link, nc);
     d_.conduit_n1 = upload("dw_conduit_n1", h.conduit_n1, nc);
@@ -184,6 +190,17 @@ void KokkosDwMarcher::bind(const DwDeviceNetwork& network) {
     d_.conduit_length = upload("dw_conduit_length", h.conduit_length, nc);
     d_.conduit_beta = upload("dw_conduit_beta", h.conduit_beta, nc);
     d_.conduit_q_max = upload("dw_conduit_q_max", h.conduit_q_max, nc);
+    d_.conduit_links_length = upload("dw_conduit_links_length", h.conduit_links_length, nc);
+    d_.conduit_rough_factor = upload("dw_conduit_rough_factor", h.conduit_rough_factor, nc);
+    d_.conduit_barrels = upload("dw_conduit_barrels", h.conduit_barrels, nc);
+    d_.conduit_is_closed = upload("dw_conduit_is_closed", h.conduit_is_closed, nc);
+    d_.conduit_has_losses = upload("dw_conduit_has_losses", h.conduit_has_losses, nc);
+    d_.conduit_loss_inlet = upload("dw_conduit_loss_inlet", h.conduit_loss_inlet, nc);
+    d_.conduit_loss_outlet = upload("dw_conduit_loss_outlet", h.conduit_loss_outlet, nc);
+    d_.conduit_loss_avg = upload("dw_conduit_loss_avg", h.conduit_loss_avg, nc);
+    d_.conduit_q_limit = upload("dw_conduit_q_limit", h.conduit_q_limit, nc);
+    d_.conduit_has_flap_gate = upload("dw_conduit_has_flap_gate", h.conduit_has_flap_gate, nc);
+    d_.conduit_direction = upload("dw_conduit_direction", h.conduit_direction, nc);
 
     // The shared geometry tables, copied to the device once.
     const step::Tables& t = h.tables;
@@ -214,6 +231,24 @@ void KokkosDwMarcher::bind(const DwDeviceNetwork& network) {
     for (double** field : geometry)
         *field = alloc<double>("dw_geometry", nc);
     d_.flow_class = alloc<std::int8_t>("dw_flow_class", nc);
+
+    // Per-step inputs: filled from the host at every execute(), never copied back.
+    setting_ = alloc<double>("dw_conduit_setting", nc);
+    d_.conduit_setting = setting_;
+    old_flow_ = alloc<double>("dw_conduit_old_flow", nc);
+    d_.conduit_old_flow = old_flow_;
+    area_old_ = alloc<double>("dw_area_old", nc);
+    d_.area_old = area_old_;
+
+    double** momentum[] = {&d_.link_flow,   &d_.link_dqdh, &d_.link_depth,
+                           &d_.link_volume, &d_.new_flow,  &d_.dqdh,
+                           &d_.velocity,    &d_.froude,    &d_.sigma};
+    for (double** field : momentum)
+        *field = alloc<double>("dw_momentum", nc);
+    d_.category = alloc<std::uint8_t>("dw_category", nc);
+    d_.full_state = alloc<std::int8_t>("dw_full_state", nc);
+    d_.inlet_control = alloc<std::uint8_t>("dw_inlet_control", nc);
+    d_.normal_flow_limited = alloc<std::uint8_t>("dw_normal_flow_limited", nc);
 }
 
 std::vector<Sync> KokkosDwMarcher::stateOf(const step::Arrays& h) const {
@@ -242,6 +277,28 @@ std::vector<Sync> KokkosDwMarcher::stateOf(const step::Arrays& h) const {
     pairOf(list, d_.wcap_d2, h.wcap_d2, nc);
     pairOf(list, d_.wcap_dm, h.wcap_dm, nc);
     pairOf(list, d_.flow_class, h.flow_class, nc);
+    pairOf(list, d_.link_flow, h.link_flow, nc);
+    pairOf(list, d_.link_dqdh, h.link_dqdh, nc);
+    pairOf(list, d_.link_depth, h.link_depth, nc);
+    pairOf(list, d_.link_volume, h.link_volume, nc);
+    pairOf(list, d_.new_flow, h.new_flow, nc);
+    pairOf(list, d_.dqdh, h.dqdh, nc);
+    pairOf(list, d_.velocity, h.velocity, nc);
+    pairOf(list, d_.froude, h.froude, nc);
+    pairOf(list, d_.sigma, h.sigma, nc);
+    pairOf(list, d_.category, h.category, nc);
+    pairOf(list, d_.full_state, h.full_state, nc);
+    pairOf(list, d_.inlet_control, h.inlet_control, nc);
+    pairOf(list, d_.normal_flow_limited, h.normal_flow_limited, nc);
+    return list;
+}
+
+std::vector<Sync> KokkosDwMarcher::inputsOf(const step::Arrays& h) const {
+    const int nc = d_.n_conduits;
+    std::vector<Sync> list;
+    pairOf(list, setting_, h.conduit_setting, nc);
+    pairOf(list, old_flow_, h.conduit_old_flow, nc);
+    pairOf(list, area_old_, h.area_old, nc);
     return list;
 }
 
@@ -261,6 +318,13 @@ void KokkosDwMarcher::linkGeometry() {
         KOKKOS_LAMBDA(const int c) { step::linkGeometry(D, c); });
 }
 
+void KokkosDwMarcher::momentum(double dt, int iteration) {
+    const step::Arrays D = d_;
+    Kokkos::parallel_for(
+        "dw_momentum", Range(0, D.n_conduits),
+        KOKKOS_LAMBDA(const int c) { step::conduitMomentum(D, c, dt, iteration); });
+}
+
 DwDeviceResult KokkosDwMarcher::execute(const DwDeviceStep& step) {
     DwDeviceResult r;
     try {
@@ -268,6 +332,10 @@ DwDeviceResult KokkosDwMarcher::execute(const DwDeviceStep& step) {
             throw std::runtime_error("the device Picard loop needs the host stage callback");
         const std::vector<Sync> state = stateOf(step.host);
         push(state);
+        push(inputsOf(step.host));
+        d_.omega = step.host.omega;
+        d_.normal_flow_ltd = step.host.normal_flow_ltd;
+        d_.inertial_damping = step.host.inertial_damping;
 
         // DWSolver::execute's loop control (DynamicWave.cpp:1564-1648).
         int iterations = 0;
@@ -276,7 +344,7 @@ DwDeviceResult KokkosDwMarcher::execute(const DwDeviceStep& step) {
         while (iterations < step.max_trials) {
             onHost(step, state, kDwInitNodes, iterations);
             linkGeometry();
-            onHost(step, state, kDwMomentum, iterations);
+            momentum(step.dt, iterations);
             onHost(step, state, kDwGather, iterations);
             onHost(step, state, kDwBoundary, iterations);
             const int unconverged = onHost(step, state, kDwNodeDepths, iterations);

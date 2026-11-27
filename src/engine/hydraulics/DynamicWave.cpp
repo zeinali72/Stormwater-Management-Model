@@ -5325,9 +5325,13 @@ step::Arrays DWSolver::deviceArrays(SimulationContext& ctx) {
     A.n_nodes = n_nodes_;
     A.n_conduits = n_conduits_;
     A.surcharge_method = static_cast<int>(surcharge_method);
+    A.omega = omega;
+    A.normal_flow_ltd = ctx.options.normal_flow_ltd;
+    A.inertial_damping = ctx.options.inertial_damping;
 
     A.node_invert = ctx.nodes.invert_elev.data();
     A.node_is_outfall = device_node_is_outfall_.data();
+    A.node_outfall_flap = device_node_outfall_flap_.data();
 
     A.conduit_link = tile_uj_.data();
     A.conduit_n1 = tile_n1_.data();
@@ -5345,6 +5349,21 @@ step::Arrays DWSolver::deviceArrays(SimulationContext& ctx) {
     A.conduit_length = tile_length_.data();
     A.conduit_beta = tile_beta_.data();
     A.conduit_q_max = tile_q_max_.data();
+    A.conduit_links_length = tile_links_length_.data();
+    A.conduit_rough_factor = tile_rough_factor_.data();
+    A.conduit_barrels = tile_barrels_d_.data();
+    A.conduit_is_closed = tile_is_closed_.data();
+    A.conduit_has_losses = tile_has_losses_.data();
+    A.conduit_loss_inlet = tile_loss_inlet_.data();
+    A.conduit_loss_outlet = tile_loss_outlet_.data();
+    A.conduit_loss_avg = tile_loss_avg_.data();
+    A.conduit_q_limit = tile_q_limit_.data();
+    A.conduit_has_flap_gate = tile_has_flap_gate_.data();
+    A.conduit_direction = tile_direction_.data();
+
+    A.conduit_setting = ctx.links.setting.data();
+    A.conduit_old_flow = ctx.links.old_flow.data();
+    A.area_old = area_old_.data();
 
     A.node_depth = ctx.nodes.depth.data();
     A.conduit_q1 = q1_.data();
@@ -5372,6 +5391,31 @@ step::Arrays DWSolver::deviceArrays(SimulationContext& ctx) {
     A.wcap_d2 = wcap_d2_.data();
     A.wcap_dm = wcap_dm_.data();
 
+    // In scope, conduit c is link c and ConduitData row c (deviceScope).
+    A.link_flow = ctx.links.flow.data();
+    A.link_dqdh = ctx.links.dqdh.data();
+    A.link_depth = ctx.links.depth.data();
+    A.link_volume = ctx.links.volume.data();
+    A.new_flow = new_flow_.data();
+    A.dqdh = dqdh_.data();
+    A.velocity = velocity_.data();
+    A.froude = froude_.data();
+    A.sigma = sigma_.data();
+    static_assert(sizeof(MomentumCategory) == sizeof(std::uint8_t) &&
+                      static_cast<std::uint8_t>(MomentumCategory::SKIP_DRY) == step::kSkipDry &&
+                      static_cast<std::uint8_t>(MomentumCategory::MANNING_OPEN) ==
+                          step::kManningOpen &&
+                      static_cast<std::uint8_t>(MomentumCategory::MANNING_CLOSED_FS) ==
+                          step::kManningClosedFs &&
+                      static_cast<std::uint8_t>(MomentumCategory::MANNING_CLOSED_FULL) ==
+                          step::kManningClosedFull,
+                  "step::k* momentum codes must match MomentumCategory");
+    A.category = reinterpret_cast<std::uint8_t*>(category_.data());
+    auto& conduits = ctx.link_subtypes.conduits;
+    A.full_state = conduits.full_state.data();
+    A.inlet_control = conduits.inlet_control.data();
+    A.normal_flow_limited = conduits.normal_flow_limited.data();
+
     A.tables = step::hostTables();
     return A;
 }
@@ -5382,9 +5426,16 @@ void DWSolver::attachDeviceMarcher(std::shared_ptr<IDwDeviceMarcher> marcher,
     if (!marcher)
         return;
     device_node_is_outfall_.assign(static_cast<std::size_t>(n_nodes_), 0);
-    for (int i = 0; i < n_nodes_; ++i)
-        device_node_is_outfall_[static_cast<std::size_t>(i)] =
-            ctx.nodes.type[static_cast<std::size_t>(i)] == NodeType::OUTFALL ? 1 : 0;
+    device_node_outfall_flap_.assign(static_cast<std::size_t>(n_nodes_), 0);
+    for (int i = 0; i < n_nodes_; ++i) {
+        const auto ui = static_cast<std::size_t>(i);
+        if (ctx.nodes.type[ui] != NodeType::OUTFALL)
+            continue;
+        device_node_is_outfall_[ui] = 1;
+        const int r = ctx.node_subtypes.outfall_row(i);
+        if (r >= 0 && ctx.node_subtypes.outfalls.has_flap_gate[static_cast<std::size_t>(r)])
+            device_node_outfall_flap_[ui] = 1;
+    }
     DwDeviceNetwork network;
     network.host = deviceArrays(const_cast<SimulationContext&>(ctx));
     marcher->bind(network);
