@@ -482,3 +482,6 @@ A SUBCATCHMENTS, NODES or LINKS entry in the [REPORT] section names an object th
 
 WARNING 110:     land use coverages of Subcatchment xxx add to more than 100 percent.
 The [COVERAGES] percentages given for the subcatchment sum to more than 100. Each land use's buildup and washoff are scaled by its own coverage, so the excess loads the subcatchment more than once. The run goes on with the values as given; EPA SWMM 5 accepts them without a message.
+
+WARNING 111:     DW_BACKEND xxx has no device dynamic wave solver in this version; the CPU solver runs.
+DW_BACKEND (or the OPENSWMM_DW_BACKEND environment variable) asks for OMP, CUDA, HIP or SYCL under FLOW_ROUTING DYNWAVE. The dynamic wave solver has no device path yet, so the CPU solver runs and results are those of DW_BACKEND CPU.
