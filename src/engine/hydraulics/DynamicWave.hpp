@@ -208,6 +208,10 @@ enum class MomentumCategory : uint8_t {
     N_CATEGORIES = 6
 };
 
+/// dev: reader of DWSolver's private state, defined by the device-kernel harness test
+/// (tests/unit/engine/test_dw_kernels_geometry.cpp). Development scaffolding, not for upstream.
+struct DwStageProbe;
+
 /**
  * @brief Dynamic wave solver — operates on entire link/node system.
  *
@@ -364,8 +368,17 @@ public:
     /// solveMomentumBatch can recompute dq6 per Picard iteration (Gap #14).
     double evap_rate = 0.0;
 
+    /// dev: development scaffolding for the device-kernel harness, not for upstream. When set,
+    /// execute() calls it from one thread at every Picard iteration (zero-based), on entry to
+    /// (point 0) and on return from (point 1) computeLinkGeometry. Null, the default, changes
+    /// nothing.
+    using StageProbe = void (*)(const DWSolver& solver, const SimulationContext& ctx, int iteration,
+                                int point);
+    static StageProbe stage_probe; ///< dev: the harness probe; null unless a test sets it
+
 private:
     friend class ::openswmm::Router; // explicit internal checkpoint fields only
+    friend struct DwStageProbe;      // dev: device-kernel harness (see stage_probe)
     int n_nodes_ = 0;
     int n_links_ = 0;
     int n_conduits_ = 0;

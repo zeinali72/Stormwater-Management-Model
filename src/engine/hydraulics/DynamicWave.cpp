@@ -1461,6 +1461,8 @@ void DWSolver::setNumThreads(int n, std::vector<std::string>* warnings) {
 // Main execute -- Picard iteration
 // ============================================================================
 
+DWSolver::StageProbe DWSolver::stage_probe = nullptr; // dev: device-kernel harness
+
 int DWSolver::execute(SimulationContext& ctx, double dt,
                       DWSolver::NonConduitFlowFunc non_conduit_fn) {
     int steps = 0;
@@ -1576,7 +1578,17 @@ int DWSolver::execute(SimulationContext& ctx, double dt,
             // node depth set at the END of the PREVIOUS Picard iteration
             // (Step 4b below), exactly as legacy findLinkFlows[iter N] uses
             // the outfall depth from findNodeDepths[iter N-1].
+            if (stage_probe) { // dev: device-kernel harness
+#pragma omp barrier
+#pragma omp single
+                stage_probe(*this, ctx, t_steps, 0);
+            }
             computeLinkGeometry(ctx);
+            if (stage_probe) { // dev: device-kernel harness
+#pragma omp barrier
+#pragma omp single
+                stage_probe(*this, ctx, t_steps, 1);
+            }
 
             // ---- Steps 1.5 + 2 fused (team): per-conduit loss recompute,
             // EXTRAN/static-slot STEP E overrides, momentum classification,
