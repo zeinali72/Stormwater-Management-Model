@@ -72,6 +72,26 @@ struct DwDeviceResult {
     const char* error = nullptr;
 };
 
+/// What DWSolver::getRoutingStep's search for the critical element needs.
+struct DwCourantStep {
+    double fixed_step = 0.0;     ///< ROUTING_STEP, s; only a smaller step counts
+    double courant_factor = 0.0; ///< the COURANT factor applied to each link's step
+
+    /// The solver's arrays as they are now, sized as in DwDeviceNetwork. The marcher copies in the
+    /// link flows, volumes, midpoint areas and Froude numbers, and the node depths, dY/dt and
+    /// per-step inputs; it changes nothing.
+    step::Arrays host{};
+};
+
+/// The smallest Courant step below fixed_step and the element that sets it.
+struct DwCourantResult {
+    double dt = 0.0; ///< that step, s, before the minimum-step floor; fixed_step if none
+    int link = -1;   ///< the link setting it, or -1
+    int node = -1;   ///< the node setting it, or -1
+    bool ok = true;  ///< false: `error` says why
+    const char* error = nullptr;
+};
+
 /**
  * @brief Device Picard loop of the classic dynamic wave solver.
  *
@@ -88,6 +108,10 @@ public:
 
     /// Run the Picard loop of one routing step on the device.
     virtual DwDeviceResult execute(const DwDeviceStep& step) = 0;
+
+    /// Search the links, then the nodes, for the smallest Courant step, as
+    /// DWSolver::getRoutingStep does; a tie goes to the element searched first.
+    virtual DwCourantResult courantStep(const DwCourantStep& step) = 0;
 
     /// Short backend label for logs, e.g. "omp" or "cuda".
     virtual const char* label() const noexcept = 0;

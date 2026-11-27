@@ -113,6 +113,7 @@ public:
 
     void bind(const DwDeviceNetwork& network) override;
     DwDeviceResult execute(const DwDeviceStep& step) override;
+    DwCourantResult courantStep(const DwCourantStep& in) override;
     const char* label() const noexcept override { return kLabel; }
 
     // Public only for the reason above; not part of the interface.
@@ -129,6 +130,7 @@ private:
     template <class T> T* upload(const char* name, const T* host, int n);
     std::vector<Sync> stateOf(const step::Arrays& h) const;
     std::vector<Sync> inputsOf(const step::Arrays& h) const;
+    std::vector<Sync> courantInputsOf(const step::Arrays& h) const;
     static void push(const std::vector<Sync>& list);
     static void pull(const std::vector<Sync>& list);
     void report() const;
@@ -211,6 +213,7 @@ void KokkosDwMarcher::bind(const DwDeviceNetwork& network) {
     d_.conduit_beta = upload("dw_conduit_beta", h.conduit_beta, nc);
     d_.conduit_q_max = upload("dw_conduit_q_max", h.conduit_q_max, nc);
     d_.conduit_links_length = upload("dw_conduit_links_length", h.conduit_links_length, nc);
+    d_.conduit_mod_length = upload("dw_conduit_mod_length", h.conduit_mod_length, nc);
     d_.conduit_rough_factor = upload("dw_conduit_rough_factor", h.conduit_rough_factor, nc);
     d_.conduit_barrels = upload("dw_conduit_barrels", h.conduit_barrels, nc);
     d_.conduit_is_closed = upload("dw_conduit_is_closed", h.conduit_is_closed, nc);
@@ -450,6 +453,68 @@ DwDeviceResult KokkosDwMarcher::execute(const DwDeviceStep& step) {
         r.error = error_.c_str();
     } catch (...) {
         error_ = "unknown failure in the device Picard loop";
+        r.ok = false;
+        r.error = error_.c_str();
+    }
+    return r;
+}
+
+std::vector<Sync> KokkosDwMarcher::courantInputsOf(const step::Arrays& h) const {
+    const int nn = d_.n_nodes, nc = d_.n_conduits;
+    std::vector<Sync> list;
+    pairOf(list, d_.link_flow, h.link_flow, nc);
+    pairOf(list, d_.area_mid, h.area_mid, nc);
+    pairOf(list, d_.froude, h.froude, nc);
+    pairOf(list, d_.link_volume, h.link_volume, nc);
+    pairOf(list, node_depth_, h.node_depth, nn);
+    pairOf(list, d_.node_dydt, h.node_dydt, nn);
+    for (std::size_t k = 0; k < node_inputs_.size(); ++k)
+        if (kNodeInputs[k] == &step::Arrays::node_crown_elev)
+            pairOf(list, node_inputs_[k], h.node_crown_elev, nn);
+    return list;
+}
+
+DwCourantResult KokkosDwMarcher::courantStep(const DwCourantStep& in) {
+    DwCourantResult r;
+    try {
+        // The host may have changed the state since the last execute(); read it again.
+        push(courantInputsOf(in.host));
+        const step::Arrays D = d_;
+        const double fixed = in.fixed_step;
+        const double cf = in.courant_factor;
+        const int n = D.n_conduits + D.n_nodes;
+
+        double dt = fixed;
+        Kokkos::parallel_reduce(
+            "dw_courant_step", Range(0, n),
+            KOKKOS_LAMBDA(const int k, double& lmin) {
+                const double v = step::courantCandidate(D, k, fixed, cf);
+                if (v < lmin)
+                    lmin = v;
+            },
+            Kokkos::Min<double>(dt));
+
+        int first = n;
+        if (dt < fixed) {
+            Kokkos::parallel_reduce(
+                "dw_courant_element", Range(0, n),
+                KOKKOS_LAMBDA(const int k, int& lfirst) {
+                    if (k < lfirst && step::courantCandidate(D, k, fixed, cf) == dt)
+                        lfirst = k;
+                },
+                Kokkos::Min<int>(first));
+        }
+        r.dt = dt;
+        if (first < D.n_conduits)
+            r.link = first;
+        else if (first < n)
+            r.node = first - D.n_conduits;
+    } catch (const std::exception& e) {
+        error_ = e.what();
+        r.ok = false;
+        r.error = error_.c_str();
+    } catch (...) {
+        error_ = "unknown failure in the device Courant step";
         r.ok = false;
         r.error = error_.c_str();
     }

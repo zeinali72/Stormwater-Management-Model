@@ -23,8 +23,8 @@
  *          supports: junctions and outfalls (FREE, NORMAL, FIXED), conduits of CIRCULAR or
  *          RECT_CLOSED section with one barrel, SURCHARGE_METHOD EXTRAN or SLOT. This version
  *          holds the link geometry stage, DWSolver::computeLinkGeometry, the momentum stage,
- *          DWSolver::momentumKernels, the node stages of the Picard loop and the outfall
- *          boundaries.
+ *          DWSolver::momentumKernels, the node stages of the Picard loop, the outfall
+ *          boundaries, and the Courant step of DWSolver::getRoutingStep.
  *
  *          Each function keeps the floating-point expressions of the code it mirrors, in the same
  *          order, so the two give the same bits; the mirrored code is named in each comment, with
@@ -1964,6 +1964,103 @@ OPENSWMM_KERNEL_FN void outfallDepth(const Arrays& A, int i) noexcept {
 
     A.node_depth[i] = depth;
     A.node_head[i] = inv + depth;
+}
+
+// ===========================================================================
+// Courant step (DWSolver::getRoutingStep)
+// ===========================================================================
+
+/**
+ * @brief DWSolver::getLinkStep (DynamicWave.cpp:5136) for an in-scope conduit: its Courant step
+ *        before the COURANT factor.
+ *
+ * The DYNAMIC_SLOT branch is out of scope.
+ *
+ * @param[in] A Step arrays.
+ * @param[in] c Conduit index in [0, n_conduits); in scope, the link index.
+ * @return Seconds, or 1e10 for a conduit with no flow, no area or a Froude number at most 0.01.
+ */
+OPENSWMM_KERNEL_FN double linkStep(const Arrays& A, int c) noexcept {
+    using constants::FUDGE;
+    // The CPU divides by max(barrels, 1) as an integer; conduit_barrels is that count.
+    const double barrels = A.conduit_barrels[c];
+    const double q = std::fabs(A.link_flow[c]) / barrels;
+    if (q <= FUDGE)
+        return 1.0e10;
+
+    const double a = A.area_mid[c];
+    if (a <= FUDGE)
+        return 1.0e10;
+
+    const double L = A.conduit_links_length[c];
+    const double modL = A.conduit_mod_length[c];
+
+    const double fr = A.froude[c];
+    if (fr <= 0.01)
+        return 1.0e10;
+
+    const double vol = A.link_volume[c] / barrels;
+    double t = vol / q;
+    if (L > 0.0 && modL > 0.0)
+        t = t * modL / L;
+    t = t * fr / (1.0 + fr);
+    return t;
+}
+
+/**
+ * @brief The node term of DWSolver::getRoutingStep (DynamicWave.cpp:5042-5066).
+ *
+ * @param[in] A Step arrays.
+ * @param[in] i Node index in [0, n_nodes).
+ * @return The node's step, s, or 0 for a node that sets none.
+ */
+OPENSWMM_KERNEL_FN double nodeStep(const Arrays& A, int i) noexcept {
+    using constants::FUDGE;
+    if (A.node_is_outfall[i])
+        return 0.0;
+    const double depth = A.node_depth[i];
+    if (depth <= FUDGE)
+        return 0.0;
+
+    const double yCrown = A.node_crown_elev[i] - A.node_invert[i];
+    if (depth + FUDGE >= yCrown)
+        return 0.0;
+
+    const double max_depth = yCrown * 0.25;
+    if (max_depth < FUDGE)
+        return 0.0;
+
+    const double dYdT = A.node_dydt[i];
+    if (dYdT < FUDGE)
+        return 0.0;
+
+    return max_depth / dYdT;
+}
+
+/**
+ * @brief Element k of DWSolver::getRoutingStep's search (DynamicWave.cpp:5003), links first:
+ *        its step when that is below fixed_step, else fixed_step.
+ *
+ * The CPU keeps the first element whose step is the smallest, so the critical element is the
+ * lowest k whose value is the minimum. The virtual-junction term is out of scope.
+ *
+ * @param[in] A Step arrays.
+ * @param[in] k Link k for k < n_conduits, else node k - n_conduits.
+ * @param[in] fixed_step ROUTING_STEP, s.
+ * @param[in] courant_factor COURANT factor applied to a link's step.
+ * @return Step, s, at most fixed_step.
+ */
+OPENSWMM_KERNEL_FN double courantCandidate(const Arrays& A, int k, double fixed_step,
+                                           double courant_factor) noexcept {
+    if (k < A.n_conduits) {
+        double t = linkStep(A, k);
+        if (t <= 0.0 || t > 1.0e9)
+            return fixed_step;
+        t *= courant_factor;
+        return (t < fixed_step) ? t : fixed_step;
+    }
+    const double t = nodeStep(A, k - A.n_conduits);
+    return (t > 0.0 && t < fixed_step) ? t : fixed_step;
 }
 
 } // namespace openswmm::dynwave::step

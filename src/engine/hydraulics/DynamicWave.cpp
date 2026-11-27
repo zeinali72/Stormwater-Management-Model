@@ -5035,8 +5035,24 @@ double DWSolver::getRoutingStep(SimulationContext& ctx, double fixed_step, doubl
     int min_link = -1; // index of CFL-critical link
     int min_node = -1; // index of CFL-critical node
 
+    // A device marcher searches the links and nodes in place of the two loops below.
+    const bool on_device = static_cast<bool>(device_);
+    if (on_device) {
+        DwCourantStep in;
+        in.fixed_step = fixed_step;
+        in.courant_factor = courant_factor;
+        in.host = deviceArrays(ctx);
+        const DwCourantResult r = device_->courantStep(in);
+        if (!r.ok)
+            throw std::runtime_error(std::string("dynamic wave device Courant step failed: ") +
+                                     (r.error ? r.error : "unknown error"));
+        dt_min = r.dt;
+        min_link = r.link;
+        min_node = r.node;
+    }
+
     // Link-based CFL (matching legacy getLinkStep with CourantFactor per-link)
-    for (int j = 0; j < n_links_; ++j) {
+    for (int j = 0; !on_device && j < n_links_; ++j) {
         double t = getLinkStep(ctx, j);
         if (t <= 0.0 || t > 1.0e9)
             continue;
@@ -5050,7 +5066,7 @@ double DWSolver::getRoutingStep(SimulationContext& ctx, double fixed_step, doubl
     }
 
     // Node-based CFL (matching legacy getNodeStep)
-    for (int i = 0; i < n_nodes_; ++i) {
+    for (int i = 0; !on_device && i < n_nodes_; ++i) {
         auto ui = static_cast<std::size_t>(i);
         if (ctx.nodes.type[ui] == NodeType::OUTFALL)
             continue;
@@ -5377,6 +5393,7 @@ step::Arrays DWSolver::deviceArrays(SimulationContext& ctx) {
     A.conduit_beta = tile_beta_.data();
     A.conduit_q_max = tile_q_max_.data();
     A.conduit_links_length = tile_links_length_.data();
+    A.conduit_mod_length = ctx.link_subtypes.conduits.mod_length.data();
     A.conduit_rough_factor = tile_rough_factor_.data();
     A.conduit_barrels = tile_barrels_d_.data();
     A.conduit_is_closed = tile_is_closed_.data();

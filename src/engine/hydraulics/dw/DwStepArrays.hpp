@@ -29,8 +29,8 @@
  *          every node array by the node index. It holds what the link geometry stage
  *          (DWSolver::computeLinkGeometry), the momentum stage (DWSolver::momentumKernels) and
  *          the node stages (initNodeStates, gatherConduitNodeFlows, updateNodeDepthsTeam,
- *          findBypassedLinks) and the outfall boundaries (outfall::setAllOutfallDepths) read and
- *          write; the time step adds its own fields to the same struct.
+ *          findBypassedLinks), the outfall boundaries (outfall::setAllOutfallDepths) and the
+ *          Courant step (DWSolver::getRoutingStep) read and write.
  *
  * @see DwKernels.hpp
  * @ingroup engine_hydraulics
@@ -138,6 +138,7 @@ struct Arrays {
     const double* conduit_beta = nullptr;   ///< ConduitData::beta
     const double* conduit_q_max = nullptr;  ///< ConduitData::q_max, per barrel, cfs
     const double* conduit_links_length = nullptr; ///< routing length (true_length, else length), ft
+    const double* conduit_mod_length = nullptr;   ///< ConduitData::mod_length, ft
     const double* conduit_rough_factor = nullptr; ///< ConduitData::rough_factor
     const double* conduit_barrels = nullptr;      ///< barrel count as a double
     const std::uint8_t* conduit_is_closed = nullptr;     ///< LinkData::is_closed at initialization
