@@ -22,8 +22,8 @@
  * @details These are the bodies of DWSolver (DynamicWave.cpp) for the network the device path
  *          supports: junctions and outfalls (FREE, NORMAL, FIXED), conduits of CIRCULAR or
  *          RECT_CLOSED section with one barrel, SURCHARGE_METHOD EXTRAN or SLOT. This version
- *          holds the link geometry stage, DWSolver::computeLinkGeometry, and the momentum stage,
- *          DWSolver::momentumKernels.
+ *          holds the link geometry stage, DWSolver::computeLinkGeometry, the momentum stage,
+ *          DWSolver::momentumKernels, and the node stages of the Picard loop.
  *
  *          Each function keeps the floating-point expressions of the code it mirrors, in the same
  *          order, so the two give the same bits; the mirrored code is named in each comment, with
@@ -1657,6 +1657,264 @@ OPENSWMM_KERNEL_FN void conduitMomentum(const Arrays& A, int c, double dt, int s
 
     A.link_flow[c] = A.new_flow[c];
     A.link_dqdh[c] = A.dqdh[c];
+}
+
+// ===========================================================================
+// Nodes (initNodeStates, gatherConduitNodeFlows, updateNodeDepthsTeam, findBypassedLinks)
+// ===========================================================================
+
+/**
+ * @brief One node of DWSolver::initNodeStates (DynamicWave.cpp:1774): clear the iteration's flow
+ *        totals, dQ/dH sum and convergence flag, and seed the surface area.
+ *
+ * An in-scope node has no storage row and no 2D coupling, so only ALLOW_PONDING lets it pond and
+ * its seed area is the ponded area above full depth or zero.
+ *
+ * @param[in] A Step arrays.
+ * @param[in] i Node index in [0, n_nodes).
+ */
+OPENSWMM_KERNEL_FN void initNodeState(const Arrays& A, int i) noexcept {
+    A.node_converged[i] = 0;
+    A.node_sumdqdh[i] = 0.0;
+    const double ponded_area = A.node_ponded_area[i];
+    A.node_new_surf_area[i] =
+        (A.allow_ponding && A.node_depth[i] > A.node_full_depth[i] && ponded_area > 0.0)
+            ? ponded_area
+            : 0.0;
+    A.node_inflow[i] = 0.0;
+    A.node_outflow[i] = A.node_losses[i];
+    const double lat = A.node_lat_flow[i];
+    if (lat >= 0.0) {
+        A.node_inflow[i] += lat;
+    } else {
+        A.node_outflow[i] -= lat;
+    }
+}
+
+/**
+ * @brief One node of DWSolver::gatherConduitNodeFlows (DynamicWave.cpp:3814): add its
+ *        conduits' flows, dQ/dH and surface areas in ascending link order.
+ *
+ * The CPU's no-callback path, DWSolver::updateNodeFlows (3705), adds the same terms per node in
+ * the same order. The evaporation and seepage share is left out: its rates are zero in scope.
+ *
+ * @param[in] A Step arrays.
+ * @param[in] n Node index in [0, n_nodes).
+ */
+OPENSWMM_KERNEL_FN void gatherNodeFlows(const Arrays& A, int n) noexcept {
+    const int b0 = A.csr_row[n];
+    const int b1 = A.csr_row[n + 1];
+    if (b0 == b1)
+        return;
+
+    double inflow = A.node_inflow[n];
+    double outflow = A.node_outflow[n];
+    double sumdqdh = A.node_sumdqdh[n];
+    double surf = A.node_new_surf_area[n];
+
+    for (int k = b0; k < b1; ++k) {
+        const int j = A.csr_link[k];
+        const bool at_n2 = (A.csr_is_n2[k] != 0);
+
+        const double q = A.new_flow[j];
+        if (q >= 0.0) {
+            if (at_n2)
+                inflow += q;
+            else
+                outflow += q;
+        } else {
+            if (at_n2)
+                outflow -= q;
+            else
+                inflow -= q;
+        }
+
+        sumdqdh += A.dqdh[j];
+
+        const int barrels = static_cast<int>(A.conduit_barrels[j]);
+        surf += (at_n2 ? A.surf_area2[j] : A.surf_area1[j]) * static_cast<double>(barrels);
+    }
+
+    A.node_inflow[n] = inflow;
+    A.node_outflow[n] = outflow;
+    A.node_sumdqdh[n] = sumdqdh;
+    A.node_new_surf_area[n] = surf;
+}
+
+/**
+ * @brief DWSolver::commitNodeDepthState (DynamicWave.cpp:4878) with DWSolver::floodLimitDepth
+ *        (4837) for an in-scope junction: flooding cap, volume, dY/dt, depth and head.
+ *
+ * Not a virtual, inlet or storage node, and EXPLICIT continuity, so it holds no surcharge volume.
+ *
+ * @param[in] A Step arrays.
+ * @param[in] i Junction index.
+ * @param[in] y_new Candidate depth, ft.
+ * @param[in] dV Net inflow volume of the step, ft3.
+ * @param[in] dt Routing step, s.
+ */
+OPENSWMM_KERNEL_FN void commitJunctionDepth(const Arrays& A, int i, double y_new, double dV,
+                                            double dt) noexcept {
+    using constants::FUDGE;
+    y_new = maxOf(y_new, 0.0);
+
+    const double full_depth = A.node_full_depth[i];
+    const bool can_pond = A.allow_ponding && (A.node_ponded_area[i] > 0.0);
+    double y_max = full_depth;
+    if (!can_pond)
+        y_max += A.node_sur_depth[i];
+
+    const double rpt_full_volume = A.node_rpt_full_volume[i];
+    A.node_overflow[i] = 0.0;
+    if (y_new > y_max) {
+        if (!can_pond) {
+            A.node_overflow[i] = dV / dt;
+            A.node_volume[i] = rpt_full_volume;
+            y_new = y_max;
+        } else {
+            A.node_volume[i] = maxOf(A.node_old_volume[i] + dV, rpt_full_volume);
+            A.node_overflow[i] =
+                (A.node_volume[i] - maxOf(A.node_old_volume[i], rpt_full_volume)) / dt;
+        }
+        if (A.node_overflow[i] < FUDGE)
+            A.node_overflow[i] = 0.0;
+    } else {
+        A.node_volume[i] = (full_depth > 0.0) ? rpt_full_volume * (y_new / full_depth) : 0.0;
+    }
+    A.node_held_volume[i] = 0.0;
+
+    if (dt > 0.0) {
+        A.node_dydt[i] = std::fabs(y_new - A.node_old_depth[i]) / dt;
+    }
+
+    A.node_depth[i] = y_new;
+    A.node_head[i] = A.node_invert[i] + y_new;
+}
+
+/**
+ * @brief DWSolver::setNodeDepth (DynamicWave.cpp:4323) for an in-scope junction under EXPLICIT
+ *        continuity: the free-surface update, or under EXTRAN the dQ/dH update above the crown.
+ *
+ * @param[in] A Step arrays.
+ * @param[in] i Junction index.
+ * @param[in] dt Routing step, s.
+ * @param[in] step Zero-based Picard iteration.
+ */
+OPENSWMM_KERNEL_FN void junctionDepth(const Arrays& A, int i, double dt, int step) noexcept {
+    using constants::FUDGE;
+    const double y_old = A.node_old_depth[i];
+    const double y_last = A.node_depth[i];
+    const double full_depth = A.node_full_depth[i];
+    // NodeTile::y_crown, formed the same way in DWSolver::execute.
+    const double yCrown = A.node_crown_elev[i] - A.node_invert[i];
+
+    const bool can_pond = A.allow_ponding && (A.node_ponded_area[i] > 0.0);
+    const bool is_ponded = (can_pond && y_last > full_depth);
+
+    A.node_overflow[i] = 0.0;
+    double surf_area = A.node_new_surf_area[i];
+    surf_area = maxOf(surf_area, A.min_surf_area);
+
+    const double dQ = A.node_inflow[i] - A.node_outflow[i];
+    const double dV = 0.5 * (A.node_old_net_inflow[i] + dQ) * dt;
+
+    bool is_surcharged = false;
+    if (A.surcharge_method == kSurchargeExtran) {
+        if (is_ponded) {
+            is_surcharged = false;
+        } else {
+            is_surcharged = (yCrown > 0.0 && y_last > yCrown);
+        }
+    }
+    A.node_is_surcharged[i] = is_surcharged ? 1 : 0;
+
+    const bool use_surcharge_dqdh = is_surcharged && (A.surcharge_method == kSurchargeExtran);
+
+    double y_new;
+    if (!use_surcharge_dqdh) {
+        const double dy = dV / surf_area;
+        y_new = y_old + dy;
+        if (!is_ponded) {
+            A.node_old_surf_area[i] = surf_area;
+        }
+        if (step > 0) {
+            y_new = (1.0 - A.omega) * y_last + A.omega * y_new;
+        }
+        if (is_ponded && y_new < full_depth) {
+            y_new = full_depth - FUDGE;
+        }
+    } else {
+        double corr = 1.0;
+        if (A.node_degree[i] < 0)
+            corr = 0.6;
+
+        double denom = A.node_sumdqdh[i];
+        if (y_last < 1.25 * yCrown && yCrown > 0.0) {
+            const double f = (y_last - yCrown) / yCrown;
+            denom += (A.node_old_surf_area[i] / dt - A.node_sumdqdh[i]) * std::exp(-15.0 * f);
+        }
+
+        double dy = 0.0;
+        if (denom != 0.0) {
+            dy = corr * dQ / denom;
+        }
+        y_new = y_last + dy;
+
+        if (y_new < yCrown)
+            y_new = yCrown - FUDGE;
+        if (can_pond && y_new > full_depth) {
+            y_new = full_depth + FUDGE;
+        }
+    }
+
+    commitJunctionDepth(A, i, y_new, dV, dt);
+}
+
+/**
+ * @brief One node of DWSolver::updateNodeDepthsTeam (DynamicWave.cpp:4143) without Anderson
+ *        acceleration: update a junction's depth and test it against the head tolerance.
+ *
+ * An outfall is skipped and left unconverged, as on the CPU.
+ *
+ * @param[in] A Step arrays.
+ * @param[in] i Node index in [0, n_nodes).
+ * @param[in] dt Routing step, s.
+ * @param[in] step Zero-based Picard iteration.
+ * @return 1 for a junction that has not converged, 0 otherwise.
+ */
+OPENSWMM_KERNEL_FN int nodeDepth(const Arrays& A, int i, double dt, int step) noexcept {
+    if (A.node_is_outfall[i]) {
+        A.node_converged[i] = 0;
+        return 0;
+    }
+    const double y_last = A.node_depth[i];
+    junctionDepth(A, i, dt, step);
+    const double g_k = A.node_depth[i];
+
+    const double raw_residual = std::fabs(g_k - y_last);
+    const double accepted_movement = std::fabs(A.node_depth[i] - y_last);
+    const double tolerance = A.head_tol;
+    const std::uint8_t conv_flag =
+        (raw_residual <= tolerance && accepted_movement <= tolerance) ? 1 : 0;
+    A.node_converged[i] = conv_flag;
+    return conv_flag ? 0 : 1;
+}
+
+/**
+ * @brief One link of DWSolver::findBypassedLinks (DynamicWave.cpp:1862): bypass a conduit whose
+ *        two end nodes converged.
+ *
+ * @param[in] A Step arrays.
+ * @param[in] c Conduit index in [0, n_conduits); in scope, the link index.
+ */
+OPENSWMM_KERNEL_FN void bypassLink(const Arrays& A, int c) noexcept {
+    const int n1 = A.conduit_n1[c];
+    const int n2 = A.conduit_n2[c];
+    if (n1 < 0 || n2 < 0) {
+        A.conduit_bypassed[c] = 0;
+        return;
+    }
+    A.conduit_bypassed[c] = (A.node_converged[n1] && A.node_converged[n2]) ? 1 : 0;
 }
 
 } // namespace openswmm::dynwave::step

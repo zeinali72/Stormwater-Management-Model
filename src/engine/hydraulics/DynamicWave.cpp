@@ -5328,10 +5328,31 @@ step::Arrays DWSolver::deviceArrays(SimulationContext& ctx) {
     A.omega = omega;
     A.normal_flow_ltd = ctx.options.normal_flow_ltd;
     A.inertial_damping = ctx.options.inertial_damping;
+    A.head_tol = head_tol;
+    A.min_surf_area = min_surf_area_;
+    A.allow_ponding = ctx.options.allow_ponding ? 1 : 0;
 
     A.node_invert = ctx.nodes.invert_elev.data();
     A.node_is_outfall = device_node_is_outfall_.data();
     A.node_outfall_flap = device_node_outfall_flap_.data();
+
+    A.n_csr = static_cast<int>(csr_link_.size());
+    A.csr_row = csr_row_.data();
+    A.csr_link = csr_link_.data();
+    A.csr_is_n2 = csr_is_n2_.data();
+
+    const auto& nd = ctx.nodes;
+    A.node_old_depth = nd.old_depth.data();
+    A.node_old_volume = nd.old_volume.data();
+    A.node_old_net_inflow = nd.old_net_inflow.data();
+    A.node_lat_flow = nd.lat_flow.data();
+    A.node_losses = nd.losses.data();
+    A.node_full_depth = nd.full_depth.data();
+    A.node_crown_elev = nd.crown_elev.data();
+    A.node_ponded_area = nd.ponded_area.data();
+    A.node_sur_depth = nd.sur_depth.data();
+    A.node_rpt_full_volume = nd.rpt_full_volume.data();
+    A.node_degree = nd.degree.data();
 
     A.conduit_link = tile_uj_.data();
     A.conduit_n1 = tile_n1_.data();
@@ -5366,6 +5387,18 @@ step::Arrays DWSolver::deviceArrays(SimulationContext& ctx) {
     A.area_old = area_old_.data();
 
     A.node_depth = ctx.nodes.depth.data();
+    A.node_head = ctx.nodes.head.data();
+    A.node_volume = ctx.nodes.volume.data();
+    A.node_overflow = ctx.nodes.overflow.data();
+    A.node_held_volume = ctx.nodes.held_volume.data();
+    A.node_inflow = ctx.nodes.inflow.data();
+    A.node_outflow = ctx.nodes.outflow.data();
+    A.node_converged = xnode_.converged.data();
+    A.node_sumdqdh = xnode_.sumdqdh.data();
+    A.node_new_surf_area = xnode_.new_surf_area.data();
+    A.node_old_surf_area = xnode_.old_surf_area.data();
+    A.node_is_surcharged = xnode_.is_surcharged.data();
+    A.node_dydt = xnode_.dYdT.data();
     A.conduit_q1 = q1_.data();
     A.conduit_bypassed = bypassed_.data();
 

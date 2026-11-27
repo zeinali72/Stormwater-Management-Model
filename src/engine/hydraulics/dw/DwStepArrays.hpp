@@ -27,9 +27,10 @@
  *          section with one barrel, SURCHARGE_METHOD EXTRAN or SLOT. Every conduit array is
  *          indexed by the conduit's position c in DWSolver's dense conduit tile (0..n_conduits-1),
  *          every node array by the node index. It holds what the link geometry stage
- *          (DWSolver::computeLinkGeometry) and the momentum stage (DWSolver::momentumKernels) read and
- *          write; the later stages (node update, outfall boundaries, time step) add their own
- *          fields to the same struct.
+ *          (DWSolver::computeLinkGeometry), the momentum stage (DWSolver::momentumKernels) and
+ *          the node stages (initNodeStates, gatherConduitNodeFlows, updateNodeDepthsTeam,
+ *          findBypassedLinks) read and write; the outfall boundaries and the time step add
+ *          their own fields to the same struct.
  *
  * @see DwKernels.hpp
  * @ingroup engine_hydraulics
@@ -72,6 +73,7 @@ struct Arrays {
     // ---- sizes ------------------------------------------------------------
     int n_nodes = 0;    ///< nodes in the network
     int n_conduits = 0; ///< conduits in DWSolver's dense conduit tile
+    int n_csr = 0;      ///< entries of the node-to-conduit adjacency (csr_link, csr_is_n2)
 
     // ---- options (static) -------------------------------------------------
     int surcharge_method = kSurchargeExtran; ///< kSurchargeExtran or kSurchargeSlot
@@ -80,11 +82,32 @@ struct Arrays {
     double omega = 0.0;       ///< DWSolver::omega, the Picard under-relaxation weight
     int normal_flow_ltd = 0;  ///< SimulationOptions::normal_flow_ltd
     int inertial_damping = 0; ///< SimulationOptions::inertial_damping
+    double head_tol = 0.0;    ///< DWSolver::head_tol, the node convergence tolerance, ft
+    double min_surf_area = 0.0; ///< DWSolver::min_surf_area_, ft2
+    int allow_ponding = 0;      ///< SimulationOptions::allow_ponding
 
     // ---- nodes (static) ---------------------------------------------------
     const double* node_invert = nullptr;           ///< NodeData::invert_elev, ft
     const std::uint8_t* node_is_outfall = nullptr; ///< 1 for an OUTFALL node
     const std::uint8_t* node_outfall_flap = nullptr; ///< 1 for an OUTFALL node with a flap gate
+
+    // ---- node-to-conduit adjacency (static; DWSolver::buildConduitNodeCSR) --
+    const int* csr_row = nullptr;            ///< n_nodes + 1 offsets into csr_link
+    const int* csr_link = nullptr;           ///< incident conduit, ascending per node
+    const std::uint8_t* csr_is_n2 = nullptr; ///< 1 where the node is the conduit's node2 end
+
+    // ---- node inputs of one routing step (read only by the loop) ------------
+    const double* node_old_depth = nullptr;       ///< NodeData::old_depth, ft
+    const double* node_old_volume = nullptr;      ///< NodeData::old_volume, ft3
+    const double* node_old_net_inflow = nullptr;  ///< NodeData::old_net_inflow, cfs
+    const double* node_lat_flow = nullptr;        ///< NodeData::lat_flow, cfs
+    const double* node_losses = nullptr;          ///< NodeData::losses, cfs
+    const double* node_full_depth = nullptr;      ///< NodeData::full_depth, ft
+    const double* node_crown_elev = nullptr;      ///< NodeData::crown_elev, ft
+    const double* node_ponded_area = nullptr;     ///< NodeData::ponded_area, ft2
+    const double* node_sur_depth = nullptr;       ///< NodeData::sur_depth, ft
+    const double* node_rpt_full_volume = nullptr; ///< NodeData::rpt_full_volume, ft3
+    const int* node_degree = nullptr;             ///< NodeData::degree; negative upstream end
 
     // ---- conduits (static) ------------------------------------------------
     const int* conduit_link = nullptr;  ///< global link index of conduit c
@@ -121,11 +144,23 @@ struct Arrays {
     const double* area_old = nullptr;         ///< midpoint area at the step start, ft2
 
     // ---- node state (one Picard iteration) --------------------------------
-    const double* node_depth = nullptr; ///< NodeData::depth, ft
+    double* node_depth = nullptr;               ///< NodeData::depth, ft
+    double* node_head = nullptr;                ///< NodeData::head, ft
+    double* node_volume = nullptr;              ///< NodeData::volume, ft3
+    double* node_overflow = nullptr;            ///< NodeData::overflow, cfs
+    double* node_held_volume = nullptr;         ///< NodeData::held_volume, ft3
+    double* node_inflow = nullptr;              ///< NodeData::inflow, cfs
+    double* node_outflow = nullptr;             ///< NodeData::outflow, cfs
+    std::uint8_t* node_converged = nullptr;     ///< DWNodeArrays::converged
+    double* node_sumdqdh = nullptr;             ///< DWNodeArrays::sumdqdh, ft2/s
+    double* node_new_surf_area = nullptr;       ///< DWNodeArrays::new_surf_area, ft2
+    double* node_old_surf_area = nullptr;       ///< DWNodeArrays::old_surf_area, ft2
+    std::uint8_t* node_is_surcharged = nullptr; ///< DWNodeArrays::is_surcharged
+    double* node_dydt = nullptr;                ///< DWNodeArrays::dYdT, ft/s
 
     // ---- conduit state read by the geometry stage --------------------------
     double* conduit_q1 = nullptr;                   ///< last per-barrel flow (DWSolver::q1_), cfs
-    const std::uint8_t* conduit_bypassed = nullptr; ///< both end nodes converged (held this pass)
+    std::uint8_t* conduit_bypassed = nullptr;       ///< both end nodes converged (held this pass)
 
     // ---- link geometry (written for live conduits, held for bypassed ones) --
     double* depth1 = nullptr;          ///< upstream flow depth, ft

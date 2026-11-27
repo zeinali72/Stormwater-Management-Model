@@ -82,6 +82,15 @@ struct Sync {
     std::size_t bytes = 0;
 };
 
+/// The per-step node inputs of step::Arrays, copied to the device at every execute().
+using NodeInput = const double* step::Arrays::*;
+constexpr NodeInput kNodeInputs[] = {
+    &step::Arrays::node_old_depth,      &step::Arrays::node_old_volume,
+    &step::Arrays::node_old_net_inflow, &step::Arrays::node_lat_flow,
+    &step::Arrays::node_losses,         &step::Arrays::node_full_depth,
+    &step::Arrays::node_crown_elev,     &step::Arrays::node_ponded_area,
+    &step::Arrays::node_sur_depth,      &step::Arrays::node_rpt_full_volume};
+
 /// Pair a device array with its host array; a null or empty host array is left out.
 template <class T> void pairOf(std::vector<Sync>& list, T* dev, const T* host, int n) {
     if (dev == nullptr || host == nullptr || n <= 0)
@@ -112,6 +121,10 @@ public:
     // Public only for the reason above; not part of the interface.
     void linkGeometry();
     void momentum(double dt, int iteration);
+    void initNodes();
+    void gatherNodeFlows();
+    int nodeDepths(double dt, int iteration);
+    void bypass();
 
 private:
     template <class T> T* alloc(const char* name, int n);
@@ -131,6 +144,8 @@ private:
     double* setting_ = nullptr;
     double* old_flow_ = nullptr;
     double* area_old_ = nullptr;
+    std::vector<double*> node_inputs_; ///< device arrays of kNodeInputs, in its order
+    int* node_degree_ = nullptr;
     long steps_ = 0;
     long host_stages_ = 0;
     std::string error_;
@@ -168,11 +183,15 @@ void KokkosDwMarcher::bind(const DwDeviceNetwork& network) {
     d_ = step::Arrays{};
     d_.n_nodes = nn;
     d_.n_conduits = nc;
+    d_.n_csr = h.n_csr;
     d_.surcharge_method = h.surcharge_method;
 
     d_.node_invert = upload("dw_node_invert", h.node_invert, nn);
     d_.node_is_outfall = upload("dw_node_is_outfall", h.node_is_outfall, nn);
     d_.node_outfall_flap = upload("dw_node_outfall_flap", h.node_outfall_flap, nn);
+    d_.csr_row = upload("dw_csr_row", h.csr_row, nn + 1);
+    d_.csr_link = upload("dw_csr_link", h.csr_link, h.n_csr);
+    d_.csr_is_n2 = upload("dw_csr_is_n2", h.csr_is_n2, h.n_csr);
 
     d_.conduit_link = upload("dw_conduit_link", h.conduit_link, nc);
     d_.conduit_n1 = upload("dw_conduit_n1", h.conduit_n1, nc);
@@ -219,6 +238,14 @@ void KokkosDwMarcher::bind(const DwDeviceNetwork& network) {
     // State: allocated here, filled from the host at every execute().
     node_depth_ = alloc<double>("dw_node_depth", nn);
     d_.node_depth = node_depth_;
+    double** nodes[] = {&d_.node_head,        &d_.node_volume,        &d_.node_overflow,
+                        &d_.node_held_volume, &d_.node_inflow,        &d_.node_outflow,
+                        &d_.node_sumdqdh,     &d_.node_new_surf_area, &d_.node_old_surf_area,
+                        &d_.node_dydt};
+    for (double** field : nodes)
+        *field = alloc<double>("dw_node_state", nn);
+    d_.node_converged = alloc<std::uint8_t>("dw_node_converged", nn);
+    d_.node_is_surcharged = alloc<std::uint8_t>("dw_node_is_surcharged", nn);
     q1_ = alloc<double>("dw_q1", nc);
     d_.conduit_q1 = q1_;
     bypassed_ = alloc<std::uint8_t>("dw_bypassed", nc);
@@ -239,6 +266,13 @@ void KokkosDwMarcher::bind(const DwDeviceNetwork& network) {
     d_.conduit_old_flow = old_flow_;
     area_old_ = alloc<double>("dw_area_old", nc);
     d_.area_old = area_old_;
+    node_degree_ = alloc<int>("dw_node_degree", nn);
+    d_.node_degree = node_degree_;
+    node_inputs_.clear();
+    for (NodeInput field : kNodeInputs) {
+        node_inputs_.push_back(alloc<double>("dw_node_input", nn));
+        d_.*field = node_inputs_.back();
+    }
 
     double** momentum[] = {&d_.link_flow,   &d_.link_dqdh, &d_.link_depth,
                            &d_.link_volume, &d_.new_flow,  &d_.dqdh,
@@ -255,6 +289,18 @@ std::vector<Sync> KokkosDwMarcher::stateOf(const step::Arrays& h) const {
     const int nn = d_.n_nodes, nc = d_.n_conduits;
     std::vector<Sync> list;
     pairOf(list, node_depth_, h.node_depth, nn);
+    pairOf(list, d_.node_head, h.node_head, nn);
+    pairOf(list, d_.node_volume, h.node_volume, nn);
+    pairOf(list, d_.node_overflow, h.node_overflow, nn);
+    pairOf(list, d_.node_held_volume, h.node_held_volume, nn);
+    pairOf(list, d_.node_inflow, h.node_inflow, nn);
+    pairOf(list, d_.node_outflow, h.node_outflow, nn);
+    pairOf(list, d_.node_converged, h.node_converged, nn);
+    pairOf(list, d_.node_sumdqdh, h.node_sumdqdh, nn);
+    pairOf(list, d_.node_new_surf_area, h.node_new_surf_area, nn);
+    pairOf(list, d_.node_old_surf_area, h.node_old_surf_area, nn);
+    pairOf(list, d_.node_is_surcharged, h.node_is_surcharged, nn);
+    pairOf(list, d_.node_dydt, h.node_dydt, nn);
     pairOf(list, q1_, h.conduit_q1, nc);
     pairOf(list, bypassed_, h.conduit_bypassed, nc);
     pairOf(list, d_.depth1, h.depth1, nc);
@@ -299,6 +345,9 @@ std::vector<Sync> KokkosDwMarcher::inputsOf(const step::Arrays& h) const {
     pairOf(list, setting_, h.conduit_setting, nc);
     pairOf(list, old_flow_, h.conduit_old_flow, nc);
     pairOf(list, area_old_, h.area_old, nc);
+    pairOf(list, node_degree_, h.node_degree, d_.n_nodes);
+    for (std::size_t k = 0; k < node_inputs_.size(); ++k)
+        pairOf(list, node_inputs_[k], h.*kNodeInputs[k], d_.n_nodes);
     return list;
 }
 
@@ -316,6 +365,38 @@ void KokkosDwMarcher::linkGeometry() {
     Kokkos::parallel_for(
         "dw_link_geometry", Range(0, D.n_conduits),
         KOKKOS_LAMBDA(const int c) { step::linkGeometry(D, c); });
+}
+
+void KokkosDwMarcher::initNodes() {
+    const step::Arrays D = d_;
+    Kokkos::parallel_for(
+        "dw_init_nodes", Range(0, D.n_nodes),
+        KOKKOS_LAMBDA(const int i) { step::initNodeState(D, i); });
+}
+
+void KokkosDwMarcher::gatherNodeFlows() {
+    const step::Arrays D = d_;
+    Kokkos::parallel_for(
+        "dw_gather_node_flows", Range(0, D.n_nodes),
+        KOKKOS_LAMBDA(const int n) { step::gatherNodeFlows(D, n); });
+}
+
+int KokkosDwMarcher::nodeDepths(double dt, int iteration) {
+    const step::Arrays D = d_;
+    int unconverged = 0;
+    // An integer count: the reduction order does not change it.
+    Kokkos::parallel_reduce(
+        "dw_node_depths", Range(0, D.n_nodes),
+        KOKKOS_LAMBDA(const int i, int& sum) { sum += step::nodeDepth(D, i, dt, iteration); },
+        unconverged);
+    return unconverged;
+}
+
+void KokkosDwMarcher::bypass() {
+    const step::Arrays D = d_;
+    Kokkos::parallel_for(
+        "dw_bypass", Range(0, D.n_conduits),
+        KOKKOS_LAMBDA(const int c) { step::bypassLink(D, c); });
 }
 
 void KokkosDwMarcher::momentum(double dt, int iteration) {
@@ -336,24 +417,27 @@ DwDeviceResult KokkosDwMarcher::execute(const DwDeviceStep& step) {
         d_.omega = step.host.omega;
         d_.normal_flow_ltd = step.host.normal_flow_ltd;
         d_.inertial_damping = step.host.inertial_damping;
+        d_.head_tol = step.host.head_tol;
+        d_.min_surf_area = step.host.min_surf_area;
+        d_.allow_ponding = step.host.allow_ponding;
 
         // DWSolver::execute's loop control (DynamicWave.cpp:1564-1648).
         int iterations = 0;
         bool converged = false;
         const long before = host_stages_;
         while (iterations < step.max_trials) {
-            onHost(step, state, kDwInitNodes, iterations);
+            initNodes();
             linkGeometry();
             momentum(step.dt, iterations);
-            onHost(step, state, kDwGather, iterations);
+            gatherNodeFlows();
             onHost(step, state, kDwBoundary, iterations);
-            const int unconverged = onHost(step, state, kDwNodeDepths, iterations);
+            const int unconverged = nodeDepths(step.dt, iterations);
             converged = (unconverged == 0);
             ++iterations;
             if (iterations > 1) {
                 if (converged)
                     break;
-                onHost(step, state, kDwBypass, iterations);
+                bypass();
             }
         }
 
