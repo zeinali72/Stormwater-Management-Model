@@ -21,7 +21,7 @@ import sys
 # Report lines that legitimately differ: wall clock.
 VOLATILE = re.compile(r"Analysis begun|Analysis ended|Total elapsed")
 # Printed by the plugin's marcher when it is destroyed.
-MARCHER = re.compile(r"\[openswmm DW\] \w+ marcher: (\d+) routing steps, (\d+) host stages")
+MARCHER = re.compile(r"\[openswmm DW\] \w+ marcher: (\d+) routing steps")
 
 
 def forced_deck(text, forced):
@@ -82,8 +82,6 @@ def main():
                         help="extra [OPTIONS] override applied to both runs")
     parser.add_argument("--expect-refusal", default=None, metavar="TEXT",
                         help="the plugin run must report this unsupported item and use the CPU")
-    parser.add_argument("--allow-host-stages", action="store_true",
-                        help="accept Picard stages the plugin ran on the host")
     args = parser.parse_args()
     # The engine runs inside each run folder, so every path must be absolute.
     args.engine = args.engine.resolve()
@@ -146,8 +144,6 @@ def main():
         marcher = MARCHER.search(device_log)
         if not marcher or int(marcher.group(1)) == 0:
             raise AssertionError("the device marcher ran no routing step:\n" + device_log[-2000:])
-        if int(marcher.group(2)) != 0 and not args.allow_host_stages:
-            raise AssertionError(f"{marcher.group(2)} Picard stages ran on the host")
 
     failures = []
     for item in ("out.out", "end_state.hsf"):

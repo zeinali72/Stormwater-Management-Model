@@ -23,7 +23,8 @@
  *          supports: junctions and outfalls (FREE, NORMAL, FIXED), conduits of CIRCULAR or
  *          RECT_CLOSED section with one barrel, SURCHARGE_METHOD EXTRAN or SLOT. This version
  *          holds the link geometry stage, DWSolver::computeLinkGeometry, the momentum stage,
- *          DWSolver::momentumKernels, and the node stages of the Picard loop.
+ *          DWSolver::momentumKernels, the node stages of the Picard loop and the outfall
+ *          boundaries.
  *
  *          Each function keeps the floating-point expressions of the code it mirrors, in the same
  *          order, so the two give the same bits; the mirrored code is named in each comment, with
@@ -1915,6 +1916,54 @@ OPENSWMM_KERNEL_FN void bypassLink(const Arrays& A, int c) noexcept {
         return;
     }
     A.conduit_bypassed[c] = (A.node_converged[n1] && A.node_converged[n2]) ? 1 : 0;
+}
+
+// ===========================================================================
+// Outfalls (outfall::setAllOutfallDepths)
+// ===========================================================================
+
+/**
+ * @brief One outfall of outfall::setAllOutfallDepths (Outfall.cpp:305) for a FREE, NORMAL or
+ *        FIXED outfall whose depth a conduit sets, with no 2D tailwater and no forced stage.
+ *
+ * Outfall.cpp getYnorm (166) is normalDepth with its two cap tests swapped, and its section
+ * (buildXSectParams, 91) carries the same in-scope fields as sectionOf.
+ *
+ * @param[in] A Step arrays; node_depth and node_head of an outfall are written.
+ * @param[in] i Node index in [0, n_nodes); a node with no outfall link is left alone.
+ */
+OPENSWMM_KERNEL_FN void outfallDepth(const Arrays& A, int i) noexcept {
+    const int j = A.node_outfall_link[i];
+    if (j < 0)
+        return;
+    const double z = A.node_outfall_offset[i];
+
+    // The CPU divides by max(barrels, 1) as an integer; conduit_barrels is that count.
+    const double q = std::fabs(A.link_flow[j]) / A.conduit_barrels[j];
+    const Section xs = sectionOf(A, j);
+    const double yNorm = normalDepth(A.tables, xs, A.conduit_beta[j], A.conduit_q_max[j], q);
+    double yCrit = scalarYcrit(A.tables, xs, q);
+
+    const double inv = A.node_invert[i];
+    double depth = 0.0;
+    const int type = A.node_outfall_type[i];
+    if (type == kOutfallFree) {
+        depth = z + minOf(yNorm, yCrit);
+    } else if (type == kOutfallNormal) {
+        depth = z + yNorm;
+    } else {
+        const double stage = A.node_outfall_stage[i];
+        yCrit = minOf(yCrit, yNorm);
+        if (yCrit + z + inv < stage)
+            depth = stage - inv;
+        else if (z > 0.0)
+            depth = (stage < inv + z) ? maxOf(0.0, stage - inv) : z + yCrit;
+        else
+            depth = yCrit;
+    }
+
+    A.node_depth[i] = depth;
+    A.node_head[i] = inv + depth;
 }
 
 } // namespace openswmm::dynwave::step

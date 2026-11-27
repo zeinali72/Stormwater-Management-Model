@@ -407,9 +407,16 @@ private:
 
     /// Device Picard loop (DwDeviceMarcher.hpp); null runs the CPU loop.
     std::shared_ptr<IDwDeviceMarcher> device_;
-    /// OUTFALL flag per node, for the device path's static arrays.
-    std::vector<uint8_t> device_node_is_outfall_;
-    std::vector<uint8_t> device_node_outfall_flap_; ///< outfall with a flap gate, by node
+    /// Outfall boundaries by node, for the device path's static arrays (step::Arrays).
+    struct DeviceOutfalls {
+        std::vector<uint8_t> is_outfall; ///< 1 for an OUTFALL node
+        std::vector<uint8_t> flap;       ///< 1 for an outfall with a flap gate
+        std::vector<int> link;           ///< OutfallData::link_idx; -1 for none
+        std::vector<int> type;           ///< step::kOutfallFree, kOutfallNormal or kOutfallFixed
+        std::vector<double> offset;      ///< OutfallData::link_offset, ft
+        std::vector<double> stage;       ///< FIXED stage (OutfallData::param), ft
+    };
+    DeviceOutfalls device_outfalls_;
 
     /**
      * @brief Point a step::Arrays at this solver's arrays and the context's.
@@ -438,16 +445,11 @@ private:
      *
      * @param[in,out] ctx Context of the step.
      * @param[in] dt Routing step, s.
-     * @param[in] non_conduit_fn The structure callback execute() was given.
      * @param[out] converged The last iteration's convergence.
      * @return Picard iterations performed.
      * @throws std::runtime_error When the marcher fails.
      */
-    int executeOnDevice(SimulationContext& ctx, double dt, const NonConduitFlowFunc& non_conduit_fn,
-                        bool& converged);
-
-    /// DwHostStage: run one Picard stage on the host for the device marcher.
-    static int deviceHostStage(void* user, int stage, int iteration);
+    int executeOnDevice(SimulationContext& ctx, double dt, bool& converged);
 
     /// True if any conduit has a nonzero seepage rate (set once in init()).
     /// With zero evaporation this gates the bit-exact dead-work skip of

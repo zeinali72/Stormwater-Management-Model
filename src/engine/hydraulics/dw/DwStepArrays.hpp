@@ -29,8 +29,8 @@
  *          every node array by the node index. It holds what the link geometry stage
  *          (DWSolver::computeLinkGeometry), the momentum stage (DWSolver::momentumKernels) and
  *          the node stages (initNodeStates, gatherConduitNodeFlows, updateNodeDepthsTeam,
- *          findBypassedLinks) read and write; the outfall boundaries and the time step add
- *          their own fields to the same struct.
+ *          findBypassedLinks) and the outfall boundaries (outfall::setAllOutfallDepths) read and
+ *          write; the time step adds its own fields to the same struct.
  *
  * @see DwKernels.hpp
  * @ingroup engine_hydraulics
@@ -50,6 +50,13 @@ namespace openswmm::dynwave::step {
 inline constexpr int kSurchargeExtran = 0;
 /// SURCHARGE_METHOD SLOT, numbered as dynwave::SurchargeMethod::SLOT.
 inline constexpr int kSurchargeSlot = 1;
+
+/// FREE outfall, numbered as OutfallType::FREE.
+inline constexpr int kOutfallFree = 0;
+/// NORMAL outfall, numbered as OutfallType::NORMAL.
+inline constexpr int kOutfallNormal = 1;
+/// FIXED outfall, numbered as OutfallType::FIXED.
+inline constexpr int kOutfallFixed = 2;
 
 /// The shared circular geometry tables (xsect_tables.hpp) and the Amax ratios, in whichever memory
 /// space the kernels run. Plain pointers, trivially copyable into a device kernel by value.
@@ -90,6 +97,10 @@ struct Arrays {
     const double* node_invert = nullptr;           ///< NodeData::invert_elev, ft
     const std::uint8_t* node_is_outfall = nullptr; ///< 1 for an OUTFALL node
     const std::uint8_t* node_outfall_flap = nullptr; ///< 1 for an OUTFALL node with a flap gate
+    const int* node_outfall_link = nullptr;      ///< link setting an outfall's depth; -1 for none
+    const int* node_outfall_type = nullptr;      ///< kOutfallFree, kOutfallNormal or kOutfallFixed
+    const double* node_outfall_offset = nullptr; ///< that link's offset at the outfall, ft
+    const double* node_outfall_stage = nullptr;  ///< FIXED outfall stage, ft
 
     // ---- node-to-conduit adjacency (static; DWSolver::buildConduitNodeCSR) --
     const int* csr_row = nullptr;            ///< n_nodes + 1 offsets into csr_link

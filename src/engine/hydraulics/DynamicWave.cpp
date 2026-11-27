@@ -1701,7 +1701,7 @@ int DWSolver::execute(SimulationContext& ctx, double dt,
     } // end persistent parallel region (implicit barrier)
 
     if (on_device)
-        steps_final = executeOnDevice(ctx, dt, non_conduit_fn, converged_final);
+        steps_final = executeOnDevice(ctx, dt, converged_final);
 
     steps = steps_final;
     converged = converged_final;
@@ -5273,7 +5273,9 @@ std::string DWSolver::deviceScope(const SimulationContext& ctx) const {
         if (ui < ctx.coupled_node.size() && ctx.coupled_node[ui])
             return "2D-coupled node " + name;
         const int row = ctx.node_subtypes.outfall_row(i);
-        if (type == NodeType::OUTFALL && row >= 0) {
+        if (type == NodeType::OUTFALL && row < 0)
+            return "outfall " + name + " has no outfall row";
+        if (type == NodeType::OUTFALL) {
             const OutfallType bc =
                 ctx.node_subtypes.outfalls.bc_type[static_cast<std::size_t>(row)];
             if (bc != OutfallType::FREE && bc != OutfallType::NORMAL && bc != OutfallType::FIXED)
@@ -5333,8 +5335,12 @@ step::Arrays DWSolver::deviceArrays(SimulationContext& ctx) {
     A.allow_ponding = ctx.options.allow_ponding ? 1 : 0;
 
     A.node_invert = ctx.nodes.invert_elev.data();
-    A.node_is_outfall = device_node_is_outfall_.data();
-    A.node_outfall_flap = device_node_outfall_flap_.data();
+    A.node_is_outfall = device_outfalls_.is_outfall.data();
+    A.node_outfall_flap = device_outfalls_.flap.data();
+    A.node_outfall_link = device_outfalls_.link.data();
+    A.node_outfall_type = device_outfalls_.type.data();
+    A.node_outfall_offset = device_outfalls_.offset.data();
+    A.node_outfall_stage = device_outfalls_.stage.data();
 
     A.n_csr = static_cast<int>(csr_link_.size());
     A.csr_row = csr_row_.data();
@@ -5458,16 +5464,32 @@ void DWSolver::attachDeviceMarcher(std::shared_ptr<IDwDeviceMarcher> marcher,
     device_.reset();
     if (!marcher)
         return;
-    device_node_is_outfall_.assign(static_cast<std::size_t>(n_nodes_), 0);
-    device_node_outfall_flap_.assign(static_cast<std::size_t>(n_nodes_), 0);
+    static_assert(step::kOutfallFree == static_cast<int>(OutfallType::FREE) &&
+                      step::kOutfallNormal == static_cast<int>(OutfallType::NORMAL) &&
+                      step::kOutfallFixed == static_cast<int>(OutfallType::FIXED),
+                  "step::kOutfall* codes must match OutfallType");
+    const auto nn = static_cast<std::size_t>(n_nodes_);
+    DeviceOutfalls& o = device_outfalls_;
+    o.is_outfall.assign(nn, 0);
+    o.flap.assign(nn, 0);
+    o.link.assign(nn, -1);
+    o.type.assign(nn, step::kOutfallFree);
+    o.offset.assign(nn, 0.0);
+    o.stage.assign(nn, 0.0);
+    // deviceScope() has checked every outfall has a row of type FREE, NORMAL or FIXED; the
+    // outfall-to-link map (outfall::buildOutfallLinkMap) is built before init().
+    const auto& outs = ctx.node_subtypes.outfalls;
     for (int i = 0; i < n_nodes_; ++i) {
         const auto ui = static_cast<std::size_t>(i);
         if (ctx.nodes.type[ui] != NodeType::OUTFALL)
             continue;
-        device_node_is_outfall_[ui] = 1;
-        const int r = ctx.node_subtypes.outfall_row(i);
-        if (r >= 0 && ctx.node_subtypes.outfalls.has_flap_gate[static_cast<std::size_t>(r)])
-            device_node_outfall_flap_[ui] = 1;
+        o.is_outfall[ui] = 1;
+        const auto r = static_cast<std::size_t>(ctx.node_subtypes.outfall_row(i));
+        o.flap[ui] = outs.has_flap_gate[r] ? 1 : 0;
+        o.link[ui] = outs.link_idx[r];
+        o.type[ui] = static_cast<int>(outs.bc_type[r]);
+        o.offset[ui] = outs.link_offset[r];
+        o.stage[ui] = outs.param[r];
     }
     DwDeviceNetwork network;
     network.host = deviceArrays(const_cast<SimulationContext&>(ctx));
@@ -5510,70 +5532,11 @@ bool DWSolver::deviceStepAllowed(SimulationContext& ctx) {
     return false;
 }
 
-namespace {
-/// What DWSolver::deviceHostStage needs to run a stage of one execute() on the host.
-struct DeviceHostCall {
-    DWSolver* solver;
-    SimulationContext* ctx;
-    double dt;
-    const DWSolver::NonConduitFlowFunc* non_conduit_fn;
-};
-} // namespace
-
-int DWSolver::deviceHostStage(void* user, int stage, int iteration) {
-    auto& call = *static_cast<DeviceHostCall*>(user);
-    DWSolver& s = *call.solver;
-    SimulationContext& ctx = *call.ctx;
-    const double dt = call.dt;
-    const bool has_nc = static_cast<bool>(*call.non_conduit_fn);
-    // The stages of execute()'s loop, run by one thread outside a parallel region. The
-    // surface-outfall and LID-port block after momentumKernels, and the Anderson flags before
-    // the node update, do nothing for a model in deviceScope().
-    switch (stage) {
-    case kDwInitNodes:
-        s.initNodeStates(ctx);
-        return 0;
-    case kDwGeometry:
-        s.computeLinkGeometry(ctx);
-        return 0;
-    case kDwMomentum:
-        s.momentumKernels(ctx, dt, iteration);
-        return 0;
-    case kDwGather:
-        if (has_nc)
-            s.gatherConduitNodeFlows(ctx);
-        else
-            s.updateNodeFlows(ctx);
-        return 0;
-    case kDwBoundary:
-        if (has_nc)
-            (*call.non_conduit_fn)(ctx, dt, iteration);
-        if (!s.losses_all_zero_)
-            s.limitConduitLosses(ctx, dt);
-        openswmm::outfall::setAllOutfallDepths(ctx, dt);
-        return 0;
-    case kDwNodeDepths: {
-        int unconverged = 0;
-        s.updateNodeDepthsTeam(ctx, dt, iteration, unconverged);
-        return unconverged;
-    }
-    case kDwBypass:
-        s.findBypassedLinks(ctx);
-        return 0;
-    default:
-        return 0;
-    }
-}
-
-int DWSolver::executeOnDevice(SimulationContext& ctx, double dt,
-                              const NonConduitFlowFunc& non_conduit_fn, bool& converged) {
-    DeviceHostCall call{this, &ctx, dt, &non_conduit_fn};
+int DWSolver::executeOnDevice(SimulationContext& ctx, double dt, bool& converged) {
     DwDeviceStep step;
     step.dt = dt;
     step.max_trials = max_trials;
     step.host = deviceArrays(ctx);
-    step.host_stage = &DWSolver::deviceHostStage;
-    step.user = &call;
     const DwDeviceResult r = device_->execute(step);
     if (!r.ok)
         throw std::runtime_error(std::string("dynamic wave device loop failed: ") +

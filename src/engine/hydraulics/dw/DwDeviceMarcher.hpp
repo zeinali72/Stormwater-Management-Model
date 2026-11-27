@@ -27,7 +27,7 @@
  *          carries no Kokkos and no engine types: plain structs of raw pointers (DwStepArrays.hpp)
  *          that cross the plugin boundary as-is.
  *
- *          Scope (DWSolver::deviceSupports checks it, and the CPU solver runs otherwise):
+ *          Scope (DWSolver::deviceScope checks it, and the CPU solver runs otherwise):
  *          junctions and FREE, NORMAL or FIXED outfalls, conduits of CIRCULAR or RECT_CLOSED
  *          section with one barrel, SURCHARGE_METHOD EXTRAN or SLOT, EXPLICIT node continuity.
  *
@@ -53,50 +53,21 @@ struct DwDeviceNetwork {
     step::Arrays host{};
 };
 
-/// The stages of one Picard iteration, in DWSolver::execute's order.
-enum DwStage : int {
-    kDwInitNodes = 0, ///< DWSolver::initNodeStates
-    kDwGeometry,      ///< DWSolver::computeLinkGeometry
-    kDwMomentum,      ///< DWSolver::momentumKernels
-    kDwGather,        ///< DWSolver::gatherConduitNodeFlows
-    kDwBoundary,      ///< the structure callback and outfall::setAllOutfallDepths
-    kDwNodeDepths,    ///< DWSolver::updateNodeDepthsTeam; returns the unconverged node count
-    kDwBypass,        ///< DWSolver::findBypassedLinks
-    kDwStageCount
-};
-
-/**
- * @brief A stage the device does not run yet, run on the host instead.
- *
- * The marcher copies its state back into the step's host arrays, calls this, and copies the host
- * arrays in again.
- *
- * @param[in] user The step's `user` pointer.
- * @param[in] stage A DwStage.
- * @param[in] iteration Zero-based Picard iteration.
- * @return The unconverged node count for kDwNodeDepths, zero otherwise.
- */
-using DwHostStage = int (*)(void* user, int stage, int iteration);
-
 /// One execute() worth of state, on the host. The marcher copies it to the device, iterates, and
 /// copies the state back into the same arrays.
 struct DwDeviceStep {
     double dt = 0.0;    ///< routing step, s
     int max_trials = 0; ///< Picard iteration limit
 
-    /// State and per-step inputs, all host arrays sized as in DwDeviceNetwork. The static
-    /// pointers are ignored.
+    /// State, per-step inputs and per-step options, all host arrays sized as in DwDeviceNetwork.
+    /// The static pointers are ignored.
     step::Arrays host{};
-
-    DwHostStage host_stage = nullptr; ///< runs the stages the device does not run yet
-    void* user = nullptr;             ///< passed to host_stage
 };
 
 /// What the Picard loop reports back, mirroring the CPU loop's locals.
 struct DwDeviceResult {
     int iterations = 0;     ///< Picard iterations performed
     bool converged = false; ///< the last iteration converged
-    long host_stages = 0;   ///< stages run through host_stage
     bool ok = true;         ///< false: `error` says why; the host arrays are unspecified
     const char* error = nullptr;
 };

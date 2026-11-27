@@ -22,10 +22,8 @@
  *          iterations there, copy the state back. The loop is DWSolver::execute's, and the
  *          per-element work is DwKernels.hpp compiled with OPENSWMM_KERNEL_FN =
  *          KOKKOS_INLINE_FUNCTION. Every kernel writes only the element it is called with, so the
- *          result does not depend on the thread count.
- *
- *          A stage the device does not run yet goes through the step's host callback: the state
- *          is copied back, the host runs the stage, and the state is copied in again.
+ *          result does not depend on the thread count; the one reduction, the count of
+ *          unconverged nodes, is an integer.
  *
  * @see ../DwKernels.hpp, ../DwDeviceMarcher.hpp
  * @ingroup engine_hydraulics
@@ -49,7 +47,6 @@
 #include <cstdio>
 #include <exception>
 #include <iterator>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -124,6 +121,7 @@ public:
     void initNodes();
     void gatherNodeFlows();
     int nodeDepths(double dt, int iteration);
+    void outfallDepths();
     void bypass();
 
 private:
@@ -133,7 +131,6 @@ private:
     std::vector<Sync> inputsOf(const step::Arrays& h) const;
     static void push(const std::vector<Sync>& list);
     static void pull(const std::vector<Sync>& list);
-    int onHost(const DwDeviceStep& step, const std::vector<Sync>& state, int stage, int iteration);
     void report() const;
 
     std::vector<Bytes> keep_; ///< owns every device array
@@ -147,7 +144,7 @@ private:
     std::vector<double*> node_inputs_; ///< device arrays of kNodeInputs, in its order
     int* node_degree_ = nullptr;
     long steps_ = 0;
-    long host_stages_ = 0;
+    long iterations_ = 0;
     std::string error_;
 };
 
@@ -189,6 +186,10 @@ void KokkosDwMarcher::bind(const DwDeviceNetwork& network) {
     d_.node_invert = upload("dw_node_invert", h.node_invert, nn);
     d_.node_is_outfall = upload("dw_node_is_outfall", h.node_is_outfall, nn);
     d_.node_outfall_flap = upload("dw_node_outfall_flap", h.node_outfall_flap, nn);
+    d_.node_outfall_link = upload("dw_node_outfall_link", h.node_outfall_link, nn);
+    d_.node_outfall_type = upload("dw_node_outfall_type", h.node_outfall_type, nn);
+    d_.node_outfall_offset = upload("dw_node_outfall_offset", h.node_outfall_offset, nn);
+    d_.node_outfall_stage = upload("dw_node_outfall_stage", h.node_outfall_stage, nn);
     d_.csr_row = upload("dw_csr_row", h.csr_row, nn + 1);
     d_.csr_link = upload("dw_csr_link", h.csr_link, h.n_csr);
     d_.csr_is_n2 = upload("dw_csr_is_n2", h.csr_is_n2, h.n_csr);
@@ -351,15 +352,6 @@ std::vector<Sync> KokkosDwMarcher::inputsOf(const step::Arrays& h) const {
     return list;
 }
 
-int KokkosDwMarcher::onHost(const DwDeviceStep& step, const std::vector<Sync>& state, int stage,
-                            int iteration) {
-    ++host_stages_;
-    pull(state);
-    const int r = step.host_stage(step.user, stage, iteration);
-    push(state);
-    return r;
-}
-
 void KokkosDwMarcher::linkGeometry() {
     const step::Arrays D = d_;
     Kokkos::parallel_for(
@@ -392,6 +384,13 @@ int KokkosDwMarcher::nodeDepths(double dt, int iteration) {
     return unconverged;
 }
 
+void KokkosDwMarcher::outfallDepths() {
+    const step::Arrays D = d_;
+    Kokkos::parallel_for(
+        "dw_outfall_depths", Range(0, D.n_nodes),
+        KOKKOS_LAMBDA(const int i) { step::outfallDepth(D, i); });
+}
+
 void KokkosDwMarcher::bypass() {
     const step::Arrays D = d_;
     Kokkos::parallel_for(
@@ -409,8 +408,6 @@ void KokkosDwMarcher::momentum(double dt, int iteration) {
 DwDeviceResult KokkosDwMarcher::execute(const DwDeviceStep& step) {
     DwDeviceResult r;
     try {
-        if (step.host_stage == nullptr)
-            throw std::runtime_error("the device Picard loop needs the host stage callback");
         const std::vector<Sync> state = stateOf(step.host);
         push(state);
         push(inputsOf(step.host));
@@ -424,13 +421,13 @@ DwDeviceResult KokkosDwMarcher::execute(const DwDeviceStep& step) {
         // DWSolver::execute's loop control (DynamicWave.cpp:1564-1648).
         int iterations = 0;
         bool converged = false;
-        const long before = host_stages_;
         while (iterations < step.max_trials) {
             initNodes();
             linkGeometry();
             momentum(step.dt, iterations);
             gatherNodeFlows();
-            onHost(step, state, kDwBoundary, iterations);
+            // The structure callback and DWSolver::limitConduitLosses do nothing in scope.
+            outfallDepths();
             const int unconverged = nodeDepths(step.dt, iterations);
             converged = (unconverged == 0);
             ++iterations;
@@ -445,8 +442,8 @@ DwDeviceResult KokkosDwMarcher::execute(const DwDeviceStep& step) {
         pull(state);
         r.iterations = iterations;
         r.converged = converged;
-        r.host_stages = host_stages_ - before;
         ++steps_;
+        iterations_ += iterations;
     } catch (const std::exception& e) {
         error_ = e.what();
         r.ok = false;
@@ -461,8 +458,8 @@ DwDeviceResult KokkosDwMarcher::execute(const DwDeviceStep& step) {
 
 void KokkosDwMarcher::report() const {
     if (steps_ > 0)
-        std::fprintf(stderr, "[openswmm DW] %s marcher: %ld routing steps, %ld host stages\n",
-                     kLabel, steps_, host_stages_);
+        std::fprintf(stderr, "[openswmm DW] %s marcher: %ld routing steps, %ld Picard iterations\n",
+                     kLabel, steps_, iterations_);
 }
 
 IDwDeviceMarcher* makeKokkosDwMarcher() {
