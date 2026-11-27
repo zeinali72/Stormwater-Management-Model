@@ -991,6 +991,76 @@ if(OPENSWMM_BUILD_GPU_PLUGIN AND OPENSWMM_GPU_BACKEND STREQUAL "omp" AND TARGET 
         LABELS "unit;gpu;parity" TIMEOUT 400)
 endif()
 
+# Classic dynamic wave device backend (hydraulics/dw/gpu): DW_BACKEND OMP runs the Picard loop and
+# the Courant step search on the plugin, and must reproduce the CPU solver bit for bit (binary
+# output, end-of-run hot start, report) at one thread and at several, and must name what it does
+# not support and leave it to the CPU solver.
+if(OPENSWMM_BUILD_GPU_PLUGIN AND OPENSWMM_GPU_BACKEND STREQUAL "omp" AND TARGET openswmm
+        AND TARGET openswmm_gpu_omp)
+    set(_dw_device_geometry_us
+        "${CMAKE_CURRENT_SOURCE_DIR}/data/dw_kernels_geometry/geometry_us.inp")
+    set(_dw_device_geometry_si
+        "${CMAKE_CURRENT_SOURCE_DIR}/data/dw_kernels_geometry/geometry_si.inp")
+    set(_dw_device_slot_surcharge "${PROJECT_SOURCE_DIR}/tests/regression/data/slot_surcharge.inp")
+    set(_dw_device_si_dw_quality "${PROJECT_SOURCE_DIR}/tests/parity/corpus/decks/si_dw_quality.inp")
+    set(_dw_device_b8_aq_probe "${PROJECT_SOURCE_DIR}/python/tests/legacy/output/b8_aq_probe.inp")
+    # SAVE HOTSTART refuses a heat transport run outside a native checkpoint.
+    set(_dw_device_si_dw_quality_args --option HEAT_TRANSPORT=NO)
+    foreach(_case geometry_us geometry_si slot_surcharge si_dw_quality b8_aq_probe)
+        add_test(NAME test_engine_dw_device_${_case}_t1
+            COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tests/gpu/check_dw_device_identity.py
+                --engine $<TARGET_FILE:openswmm>
+                --plugin-dir $<TARGET_FILE_DIR:openswmm_gpu_omp>
+                --input ${_dw_device_${_case}}
+                --threads 1
+                ${_dw_device_${_case}_args}
+                --output ${CMAKE_CURRENT_BINARY_DIR}/dw_device_${_case}_t1)
+        set_tests_properties(test_engine_dw_device_${_case}_t1 PROPERTIES
+            LABELS "unit;gpu;parity" TIMEOUT 300)
+    endforeach()
+    # Several threads: the kernels write only the element they are called with, and the one
+    # reduction counts nodes, so the result may not depend on the thread count.
+    foreach(_case geometry_us geometry_si slot_surcharge)
+        add_test(NAME test_engine_dw_device_${_case}_t4
+            COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tests/gpu/check_dw_device_identity.py
+                --engine $<TARGET_FILE:openswmm>
+                --plugin-dir $<TARGET_FILE_DIR:openswmm_gpu_omp>
+                --input ${_dw_device_${_case}}
+                --threads 4
+                --output ${CMAKE_CURRENT_BINARY_DIR}/dw_device_${_case}_t4)
+        set_tests_properties(test_engine_dw_device_${_case}_t4 PROPERTIES
+            LABELS "unit;gpu;parity" TIMEOUT 300 RUN_SERIAL TRUE)
+    endforeach()
+    # A 30 s routing step with VARIABLE_STEP, so the Courant step governs most steps and its
+    # critical element is tallied in the report.
+    foreach(_case geometry_us geometry_si)
+        add_test(NAME test_engine_dw_device_${_case}_courant_t4
+            COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tests/gpu/check_dw_device_identity.py
+                --engine $<TARGET_FILE:openswmm>
+                --plugin-dir $<TARGET_FILE_DIR:openswmm_gpu_omp>
+                --input ${_dw_device_${_case}}
+                --threads 4
+                --option ROUTING_STEP=30
+                --option VARIABLE_STEP=0.75
+                --output ${CMAKE_CURRENT_BINARY_DIR}/dw_device_${_case}_courant_t4)
+        set_tests_properties(test_engine_dw_device_${_case}_courant_t4 PROPERTIES
+            LABELS "unit;gpu;parity" TIMEOUT 300 RUN_SERIAL TRUE)
+    endforeach()
+    add_test(NAME test_engine_dw_device_refuses_example1
+        COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/tests/gpu/check_dw_device_identity.py
+            --engine $<TARGET_FILE:openswmm>
+            --plugin-dir $<TARGET_FILE_DIR:openswmm_gpu_omp>
+            --input ${PROJECT_SOURCE_DIR}/tests/regression/data/Example1.inp
+            --expect-refusal "outside its scope: conduit C1 is not CIRCULAR or RECT_CLOSED"
+            --output ${CMAKE_CURRENT_BINARY_DIR}/dw_device_refuses_example1)
+    set_tests_properties(test_engine_dw_device_refuses_example1 PROPERTIES
+        LABELS "unit;gpu;parity" TIMEOUT 300)
+endif()
+
 # InpWriter [2D_*] emission — end-to-end through the public C API (open a
 # 2D .inp → swmm_model_write → reopen → compare via swmm_2d_* accessors,
 # plus the GeoPackage write→reopen end-to-end). Needs the full 2D module.
