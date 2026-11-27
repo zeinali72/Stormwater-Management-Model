@@ -179,6 +179,7 @@ Three sections carry a keyword spelled `DISPERSION`, and they mean different thi
 | NORMAL_FLOW_LIMITED | SLOPE / FROUDE / BOTH / NEITHER | BOTH | Test that flags supercritical flow to be limited to normal flow: water-surface slope, Froude number, both, or neither. Hydraulics §3.3.4. |
 | NODE_CONTINUITY | EXPLICIT / SEMI_IMPLICIT | EXPLICIT | Node head update: the legacy two-branch formulation, or the unified semi-implicit one that folds flow gradients into the depth update. SEMI_IMPLICIT also changes three regulator laws that keep it from converging: submerged orifices and weirs run linearly below a 0.05 ft head difference, a bottom orifice under tailwater is corrected for submergence once, and outlets ramp below a 0.05 ft head. Hydraulics §3.5. |
 | ANDERSON_ACCEL | YES / TRUE / 1 / NO | NO | Blends each node's two most recent Picard head updates (two-point Anderson mixing) where the update is smooth. Whether it saves trials depends on the network; compare the report's Routing Time Step Summary with the option on and off. Hydraulics §3.6. |
+| DW_BACKEND | CPU / AUTO / OMP / CUDA / HIP / SYCL | AUTO | Where the dynamic wave solver runs. In this version every value runs the CPU solver: OMP, CUDA, HIP and SYCL are accepted, the CPU solver runs, and the run carries WARNING 111. The OPENSWMM_DW_BACKEND environment variable overrides the key; an unrecognised value acts as CPU. No effect under other FLOW_ROUTING methods. |
 
 #### Pressurisation and friction
 
