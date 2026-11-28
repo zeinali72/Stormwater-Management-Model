@@ -5543,6 +5543,7 @@ void DWSolver::attachDeviceMarcher(std::shared_ptr<IDwDeviceMarcher> marcher,
     o.type.assign(nn, step::kOutfallFree);
     o.offset.assign(nn, 0.0);
     o.stage.assign(nn, 0.0);
+    o.nodes.clear();
     // deviceScope() has checked every outfall has a row of type FREE, NORMAL or FIXED; the
     // outfall-to-link map (outfall::buildOutfallLinkMap) is built before init().
     const auto& outs = ctx.node_subtypes.outfalls;
@@ -5551,6 +5552,7 @@ void DWSolver::attachDeviceMarcher(std::shared_ptr<IDwDeviceMarcher> marcher,
         if (ctx.nodes.type[ui] != NodeType::OUTFALL)
             continue;
         o.is_outfall[ui] = 1;
+        o.nodes.push_back(i);
         const auto r = static_cast<std::size_t>(ctx.node_subtypes.outfall_row(i));
         o.flap[ui] = outs.has_flap_gate[r] ? 1 : 0;
         o.link[ui] = outs.link_idx[r];
@@ -5606,6 +5608,14 @@ int DWSolver::executeOnDevice(SimulationContext& ctx, double dt, bool& converged
     step.dt = dt;
     step.max_trials = max_trials;
     step.upload_all = !device_.current;
+    // swmm_node_set_head_boundary can make an outfall FIXED at a new stage during the run; the
+    // marcher uploads the rows that changed.
+    const auto& outs = ctx.node_subtypes.outfalls;
+    for (const int i : device_outfalls_.nodes) {
+        const auto r = static_cast<std::size_t>(ctx.node_subtypes.outfall_row(i));
+        device_outfalls_.type[static_cast<std::size_t>(i)] = static_cast<int>(outs.bc_type[r]);
+        device_outfalls_.stage[static_cast<std::size_t>(i)] = outs.param[r];
+    }
     step.host = deviceArrays(ctx);
     // From here the device holds the latest solver-only arrays, also when the call fails.
     device_.current = true;

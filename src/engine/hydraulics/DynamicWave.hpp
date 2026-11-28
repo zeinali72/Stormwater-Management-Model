@@ -459,6 +459,7 @@ private:
         std::vector<int> type;           ///< step::kOutfallFree, kOutfallNormal or kOutfallFixed
         std::vector<double> offset;      ///< OutfallData::link_offset, ft
         std::vector<double> stage;       ///< FIXED stage (OutfallData::param), ft
+        std::vector<int> nodes;          ///< the OUTFALL nodes, ascending
     };
     DeviceOutfalls device_outfalls_;
 

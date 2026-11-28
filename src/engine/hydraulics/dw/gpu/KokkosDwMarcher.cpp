@@ -144,13 +144,14 @@ template <auto Member> Field table(std::size_t count) {
     return f;
 }
 
-/// One changed element: its byte offset in the block, with kByte set for a 1-byte element, and
-/// its new bits.
+/// One changed element: its byte offset in the block, with kByte set for a 1-byte element or
+/// kWord for a 4-byte one, and its new bits.
 struct Delta {
     std::uint64_t at;
     std::uint64_t bits;
 };
 constexpr std::uint64_t kByte = std::uint64_t{1} << 63;
+constexpr std::uint64_t kWord = std::uint64_t{1} << 62;
 
 /// Every segment starts on this boundary, so that every element is aligned.
 constexpr std::size_t kAlign = 64;
@@ -325,6 +326,9 @@ void KokkosDwMarcher::bind(const DwDeviceNetwork& network) {
     f = field<&A::conduit_old_flow>(I, Sync::Derived, nc);
     f.ref = flow;
     add(f);
+    // swmm_node_set_head_boundary makes an outfall FIXED at a new stage during the run.
+    add(field<&A::node_outfall_type>(I, Sync::Outfalls, nn));
+    add(field<&A::node_outfall_stage>(I, Sync::Outfalls, nn));
 
     // Static data.
     add(field<&A::node_full_depth>(S, none, nn));
@@ -337,9 +341,7 @@ void KokkosDwMarcher::bind(const DwDeviceNetwork& network) {
     add(field<&A::node_is_outfall>(S, none, nn));
     add(field<&A::node_outfall_flap>(S, none, nn));
     add(field<&A::node_outfall_link>(S, none, nn));
-    add(field<&A::node_outfall_type>(S, none, nn));
     add(field<&A::node_outfall_offset>(S, none, nn));
-    add(field<&A::node_outfall_stage>(S, none, nn));
     add(field<&A::csr_row>(S, none, nn + 1));
     add(field<&A::csr_link>(S, none, ncsr));
     add(field<&A::csr_is_n2>(S, none, ncsr));
@@ -390,8 +392,9 @@ void KokkosDwMarcher::bind(const DwDeviceNetwork& network) {
     // Lay the fields out in order; the groups are declared in block order.
     std::size_t at = 0;
     for (Field& g : fields_) {
-        if (g.sync != Sync::None && g.sync != Sync::Dense && g.elem != 1 && g.elem != 8)
-            throw std::logic_error("dynamic wave device: a compared array is not 1 or 8 bytes");
+        if (g.sync != Sync::None && g.sync != Sync::Dense && g.elem != 1 && g.elem != 4 &&
+            g.elem != 8)
+            throw std::logic_error("dynamic wave device: a compared array is not 1, 4 or 8 bytes");
         g.offset = at;
         at = aligned(at + g.elem * g.count);
         if (g.group == Group::Public)
@@ -462,7 +465,7 @@ void KokkosDwMarcher::stageField(const Field& f, const void* host, const unsigne
         }
         if (std::memcmp(now, was, e) == 0)
             return;
-        Delta d{(f.offset + i * e) | (e == 1 ? kByte : 0), 0};
+        Delta d{(f.offset + i * e) | (e == 1 ? kByte : (e == 4 ? kWord : 0)), 0};
         std::memcpy(&d.bits, now, e);
         deltas_.push_back(d);
         if (!net && ref == m)
@@ -559,9 +562,11 @@ void KokkosDwMarcher::scatter(std::size_t first, std::size_t count) {
     Kokkos::parallel_for(
         "dw_scatter", Range(0, static_cast<int>(count)), KOKKOS_LAMBDA(const int k) {
             const Delta d = list[k];
-            unsigned char* p = block + (d.at & ~kByte);
+            unsigned char* p = block + (d.at & ~(kByte | kWord));
             if (d.at & kByte)
                 *p = static_cast<unsigned char>(d.bits);
+            else if (d.at & kWord)
+                *reinterpret_cast<std::uint32_t*>(p) = static_cast<std::uint32_t>(d.bits);
             else
                 *reinterpret_cast<std::uint64_t*>(p) = d.bits;
         });

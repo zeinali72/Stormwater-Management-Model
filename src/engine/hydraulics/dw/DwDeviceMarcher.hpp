@@ -26,7 +26,8 @@
  *            whole state are uploaded once, by the first call after bind() or after the solver
  *            invalidates the device copy (DwDeviceStep::upload_all);
  *          - after that a call uploads only what the host changed: the lateral inflows, and every
- *            element of an array the loop reads whose host value differs from the device's;
+ *            element whose host value differs from the device's, among the arrays the loop reads
+ *            before it writes them (the outfall stages and types included);
  *          - execute() downloads, in one transfer, every array of the model state the host can read
  *            (the public NodeData, LinkData and ConduitData arrays the loop writes), so no host
  *            reader of those arrays sees an old value;
