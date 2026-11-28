@@ -16,6 +16,7 @@
 #include "../../hydraulics/fv/gpu/KokkosNetworkMarcher.hpp"
 #include "../../hydraulics/dw/DwDeviceMarcher.hpp"
 #include "../../hydraulics/dw/gpu/KokkosDwMarcher.hpp"
+#include <atomic>
 #include <cstdio>
 #include <exception>
 
@@ -24,6 +25,9 @@
 #endif
 namespace openswmm::twoD::gpu::plugin {
 inline thread_local char error[512]{};
+/// Objects the make helpers below created and the destroy entry points have not yet destroyed. A
+/// backend may finalize its runtime at process exit only while this is zero.
+inline std::atomic<long> live_objects{0};
 /**
  * @brief Construct a plugin-owned Kokkos surface marcher with thread-local diagnostics.
  * @tparam Initialize Callable type invocable with no arguments.
@@ -39,7 +43,9 @@ template <class Initialize> void* make(Initialize initialize, bool metal = false
     error[0] = '\0';
     try {
         initialize();
-        return static_cast<ISurfaceSolver*>(new ExplicitKokkosSurfaceSolver(metal));
+        ISurfaceSolver* solver = new ExplicitKokkosSurfaceSolver(metal);
+        ++live_objects;
+        return solver;
     } catch (const std::exception& e) {
         std::snprintf(error, sizeof error, "%s", e.what());
     } catch (...) {
@@ -59,8 +65,10 @@ void* makeNetworkMarcher(Initialize initialize, bool metal = false) noexcept {
     error[0] = '\0';
     try {
         initialize();
-        return static_cast<openswmm::fv::IFvDeviceMarcher*>(
-            openswmm::fv::gpu::makeKokkosNetworkMarcher(metal));
+        openswmm::fv::IFvDeviceMarcher* marcher =
+            openswmm::fv::gpu::makeKokkosNetworkMarcher(metal);
+        ++live_objects;
+        return marcher;
     } catch (const std::exception& e) {
         std::snprintf(error, sizeof error, "%s", e.what());
     } catch (...) {
@@ -79,8 +87,10 @@ template <class Initialize> void* makeDwMarcher(Initialize initialize) noexcept 
     error[0] = '\0';
     try {
         initialize();
-        return static_cast<openswmm::dynwave::IDwDeviceMarcher*>(
-            openswmm::dynwave::gpu::makeKokkosDwMarcher());
+        openswmm::dynwave::IDwDeviceMarcher* marcher =
+            openswmm::dynwave::gpu::makeKokkosDwMarcher();
+        ++live_objects;
+        return marcher;
     } catch (const std::exception& e) {
         std::snprintf(error, sizeof error, "%s", e.what());
     } catch (...) {
@@ -96,13 +106,19 @@ extern "C" OPENSWMM_GPU_ABI const char* openswmm_gpu_last_error() {
     return openswmm::twoD::gpu::plugin::error;
 }
 extern "C" OPENSWMM_GPU_ABI void openswmm_destroy_gpu_explicit_solver(void* solver) {
+    if (solver != nullptr)
+        --openswmm::twoD::gpu::plugin::live_objects;
     delete static_cast<openswmm::twoD::ISurfaceSolver*>(solver);
 }
 
 extern "C" OPENSWMM_GPU_ABI void openswmm_destroy_gpu_network_marcher(void* marcher) {
+    if (marcher != nullptr)
+        --openswmm::twoD::gpu::plugin::live_objects;
     delete static_cast<openswmm::fv::IFvDeviceMarcher*>(marcher);
 }
 
 extern "C" OPENSWMM_GPU_ABI void openswmm_destroy_gpu_dw_marcher(void* marcher) {
+    if (marcher != nullptr)
+        --openswmm::twoD::gpu::plugin::live_objects;
     delete static_cast<openswmm::dynwave::IDwDeviceMarcher*>(marcher);
 }

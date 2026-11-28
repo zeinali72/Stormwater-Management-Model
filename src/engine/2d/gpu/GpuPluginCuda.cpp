@@ -26,9 +26,11 @@
  *          whole RHS / preconditioner / vector pipeline runs device-resident.
  *
  *          Kokkos is initialized lazily on first solver construction and is
- *          intentionally NOT finalized (same rationale as the OpenMP plugin):
- *          only this plugin uses Kokkos, and finalizing at dlclose risks
- *          destroying device Views that outlive the call.
+ *          not finalized at dlclose (same rationale as the OpenMP plugin):
+ *          only this plugin uses Kokkos, and finalizing then risks destroying
+ *          device Views that outlive the call. It is finalized at process exit
+ *          when every plugin object has been destroyed; otherwise Kokkos::Cuda
+ *          reports at exit that finalize() was never called.
  *
  *          Compiles only with a CUDA toolchain (nvcc / CUDA-clang) against a
  *          CUDA-enabled Kokkos. Not buildable on macOS/Apple Silicon.
@@ -47,6 +49,7 @@
 #include "CudaArchitectureMatch.hpp"
 #include "GpuCudaArchitectures.generated.hpp"
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <stdexcept>
 
@@ -57,6 +60,17 @@
 
 namespace {
 std::mutex initialization_mutex;
+/**
+ * @brief Finalize Kokkos at process exit once no plugin object holds device memory.
+ * @note Registered by ensureKokkosInitialized(). With an object still alive its Views would be
+ * released after finalize, which Kokkos aborts on, so Kokkos is then left initialized.
+ */
+void finalizeKokkosAtExit() {
+    std::lock_guard<std::mutex> lock(initialization_mutex);
+    if (openswmm::twoD::gpu::plugin::live_objects.load() == 0 && Kokkos::is_initialized() &&
+        !Kokkos::is_finalized())
+        Kokkos::finalize();
+}
 /**
  * @brief Initialize the plugin execution runtime once under a process-level mutex.
  * @throws std::runtime_error If Kokkos has already been finalized.
@@ -70,6 +84,7 @@ void ensureKokkosInitialized() {
         throw std::runtime_error("Kokkos runtime has already been finalized");
     if (!Kokkos::is_initialized() && !Kokkos::is_finalized()) {
         Kokkos::initialize();
+        std::atexit(finalizeKokkosAtExit);
     }
 }
 } // namespace
