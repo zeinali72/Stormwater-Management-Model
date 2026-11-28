@@ -102,7 +102,10 @@ extern "C" {
 /* v16: plugins export the 1D network substep marcher factory
  * (openswmm_make_gpu_network_marcher / openswmm_destroy_gpu_network_marcher). No existing
  * layout changes; the bump keeps a core from attaching a marcher built against other headers. */
-#define OPENSWMM_GPU_ABI_VERSION 16
+/* v17: plugins export the dynamic wave Picard loop factory
+ * (openswmm_make_gpu_dw_marcher / openswmm_destroy_gpu_dw_marcher). No existing layout changes;
+ * the bump keeps a core from attaching a marcher built against other headers. */
+#define OPENSWMM_GPU_ABI_VERSION 17
 
 /**
  * @name Surface solver capabilities (OpenSwmmGpuProbe::capabilities)
@@ -247,6 +250,21 @@ OPENSWMM_GPU_ABI void* openswmm_make_gpu_network_marcher(const OpenSwmmGpuProbe*
  * @param[in] marcher Owned result of openswmm_make_gpu_network_marcher from this loaded plugin.
  */
 OPENSWMM_GPU_ABI void openswmm_destroy_gpu_network_marcher(void* marcher);
+
+/**
+ * @brief (v17) Create the device Picard loop of the classic dynamic wave solver.
+ *
+ * @param[in] probe Probe record this plugin filled; requested_threads is honored by host backends.
+ * @return Owning openswmm::dynwave::IDwDeviceMarcher* as void*, or NULL with the reason available
+ * from openswmm_gpu_last_error. Destroy it with openswmm_destroy_gpu_dw_marcher from this plugin.
+ */
+OPENSWMM_GPU_ABI void* openswmm_make_gpu_dw_marcher(const OpenSwmmGpuProbe* probe);
+
+/**
+ * @brief (v17) Destroy a dynamic wave marcher through the plugin that allocated it; NULL is safe.
+ * @param[in] marcher Owned result of openswmm_make_gpu_dw_marcher from this loaded plugin.
+ */
+OPENSWMM_GPU_ABI void openswmm_destroy_gpu_dw_marcher(void* marcher);
 
 #ifdef __cplusplus
 } /* extern "C" */

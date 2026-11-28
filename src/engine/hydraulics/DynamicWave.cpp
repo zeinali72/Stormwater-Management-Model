@@ -55,6 +55,8 @@
  */
 
 #include "DynamicWave.hpp"
+#include "dw/DwDeviceMarcher.hpp"
+#include "dw/DwKernels.hpp"
 #include "SurfaceExchange.hpp"
 #include "Node.hpp"
 #include "Outfall.hpp"
@@ -66,6 +68,7 @@
 #include "AquiferLinkExchange.hpp"      // G-X4
 #include "../2d/coupling/PondModel.hpp" // coupled-junction pond area
 #include "../core/Constants.hpp"
+#include "../core/ErrorCodes.hpp"
 #include "../core/SimulationContext.hpp"
 #include "../core/UnitConversion.hpp"
 #include "../core/ThreadInfo.hpp"
@@ -73,6 +76,7 @@
 
 #include <cmath>
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -1551,8 +1555,11 @@ int DWSolver::execute(SimulationContext& ctx, double dt,
     bool converged_final = false;
     int unconv_shared = 0; // shared team tally (see updateNodeDepthsTeam)
     const bool has_nc = static_cast<bool>(non_conduit_fn);
+    // A device marcher runs the loop below in its place (executeOnDevice); the region is then
+    // inactive and its loop runs no iteration.
+    const bool on_device = device_ && deviceStepAllowed(ctx);
 
-#pragma omp parallel num_threads(num_threads_) if (num_threads_ > 1) default(shared)
+#pragma omp parallel num_threads(num_threads_) if (num_threads_ > 1 && !on_device) default(shared)
     {
 #if defined(__APPLE__)
         // One-time per pool thread (thread_local latch inside): QoS pin to
@@ -1564,7 +1571,7 @@ int DWSolver::execute(SimulationContext& ctx, double dt,
         int t_steps = 0;          // per-thread replica of legacy `Steps`
         bool t_converged = false; // per-thread replica of `converged`
 
-        while (t_steps < max_trials) {
+        while (!on_device && t_steps < max_trials) {
             // Step 0: init node states (team `omp for nowait` — overlaps with
             // geometry STEP A, which touches none of its outputs).
             initNodeStates(ctx);
@@ -1692,6 +1699,9 @@ int DWSolver::execute(SimulationContext& ctx, double dt,
             converged_final = t_converged;
         }
     } // end persistent parallel region (implicit barrier)
+
+    if (on_device)
+        steps_final = executeOnDevice(ctx, dt, converged_final);
 
     steps = steps_final;
     converged = converged_final;
@@ -5025,8 +5035,24 @@ double DWSolver::getRoutingStep(SimulationContext& ctx, double fixed_step, doubl
     int min_link = -1; // index of CFL-critical link
     int min_node = -1; // index of CFL-critical node
 
+    // A device marcher searches the links and nodes in place of the two loops below.
+    const bool on_device = static_cast<bool>(device_);
+    if (on_device) {
+        DwCourantStep in;
+        in.fixed_step = fixed_step;
+        in.courant_factor = courant_factor;
+        in.host = deviceArrays(ctx);
+        const DwCourantResult r = device_->courantStep(in);
+        if (!r.ok)
+            throw std::runtime_error(std::string("dynamic wave device Courant step failed: ") +
+                                     (r.error ? r.error : "unknown error"));
+        dt_min = r.dt;
+        min_link = r.link;
+        min_node = r.node;
+    }
+
     // Link-based CFL (matching legacy getLinkStep with CourantFactor per-link)
-    for (int j = 0; j < n_links_; ++j) {
+    for (int j = 0; !on_device && j < n_links_; ++j) {
         double t = getLinkStep(ctx, j);
         if (t <= 0.0 || t > 1.0e9)
             continue;
@@ -5040,7 +5066,7 @@ double DWSolver::getRoutingStep(SimulationContext& ctx, double fixed_step, doubl
     }
 
     // Node-based CFL (matching legacy getNodeStep)
-    for (int i = 0; i < n_nodes_; ++i) {
+    for (int i = 0; !on_device && i < n_nodes_; ++i) {
         auto ui = static_cast<std::size_t>(i);
         if (ctx.nodes.type[ui] == NodeType::OUTFALL)
             continue;
@@ -5229,6 +5255,311 @@ void DWSolver::accumulateLinkStepStats(SimulationContext& ctx, double dt, double
             continue;
         L.add_lstep_sample(j, std::min(t * cf, fixed_step), dt, fixed_step);
     }
+}
+
+// ============================================================================
+// Device Picard loop (DwDeviceMarcher.hpp)
+// ============================================================================
+
+std::string DWSolver::deviceScope(const SimulationContext& ctx) const {
+    if (surcharge_method != SurchargeMethod::EXTRAN && surcharge_method != SurchargeMethod::SLOT)
+        return "SURCHARGE_METHOD is not EXTRAN or SLOT";
+    if (node_continuity != NodeContinuity::EXPLICIT)
+        return "NODE_CONTINUITY is not EXPLICIT";
+    if (anderson_accel)
+        return "Anderson acceleration";
+    if (unsteady_friction != 0)
+        return "unsteady friction";
+
+    const auto& nodes = ctx.nodes;
+    for (int i = 0; i < n_nodes_; ++i) {
+        const auto ui = static_cast<std::size_t>(i);
+        const std::string name = ctx.node_names.name_of(i);
+        const NodeType type = nodes.type[ui];
+        if (type != NodeType::JUNCTION && type != NodeType::OUTFALL)
+            return "node " + name + " is not a junction or outfall";
+        if (ui < nodes.is_virtual.size() && nodes.is_virtual[ui])
+            return "virtual junction " + name;
+        if (ui < nodes.is_inlet.size() && nodes.is_inlet[ui])
+            return "inlet junction " + name;
+        if (ctx.node_subtypes.storage_row(i) >= 0)
+            return "node " + name + " has a storage row";
+        if (nodes.storage_area[ui] > 0.0)
+            return "junction " + name + " has a chamber area";
+        if (ui < ctx.coupled_node.size() && ctx.coupled_node[ui])
+            return "2D-coupled node " + name;
+        const int row = ctx.node_subtypes.outfall_row(i);
+        if (type == NodeType::OUTFALL && row < 0)
+            return "outfall " + name + " has no outfall row";
+        if (type == NodeType::OUTFALL) {
+            const OutfallType bc =
+                ctx.node_subtypes.outfalls.bc_type[static_cast<std::size_t>(row)];
+            if (bc != OutfallType::FREE && bc != OutfallType::NORMAL && bc != OutfallType::FIXED)
+                return "outfall " + name + " is not FREE, NORMAL or FIXED";
+        }
+    }
+    if (ctx.inlet_usages.count() > 0)
+        return "street inlets";
+    if (!ctx.surface_outfall_link_limit.empty())
+        return "2D surface outfall coupling";
+
+    const auto& links = ctx.links;
+    const auto& CD = ctx.link_subtypes.conduits;
+    for (int j = 0; j < n_links_; ++j) {
+        const auto uj = static_cast<std::size_t>(j);
+        const std::string name = ctx.link_names.name_of(j);
+        if (links.type[uj] != LinkType::CONDUIT)
+            return "link " + name + " is not a conduit";
+        const XsectShape shape = links.xsect_shape[uj];
+        if (shape != XsectShape::CIRCULAR && shape != XsectShape::RECT_CLOSED)
+            return "conduit " + name + " is not CIRCULAR or RECT_CLOSED";
+        const int row = ctx.link_subtypes.conduit_row(j);
+        if (row < 0)
+            return "conduit " + name + " has no conduit row";
+        const auto ur = static_cast<std::size_t>(row);
+        if (CD.barrels[ur] != 1)
+            return "conduit " + name + " has more than one barrel";
+        if (CD.culvert_code[ur] != 0)
+            return "conduit " + name + " is a culvert";
+        if (CD.seep_rate[ur] != 0.0)
+            return "conduit " + name + " seeps";
+        if (ur < CD.gw_coupled.size() && CD.gw_coupled[ur])
+            return "conduit " + name + " is aquifer-coupled";
+    }
+    if (n_conduits_ == 0)
+        return "a network with no conduits";
+    // The device arrays are indexed by conduit; with every link a conduit, conduit c must be link
+    // c and ConduitData row c, so the solver's link arrays serve as conduit arrays as they are.
+    for (int ci = 0; ci < n_conduits_; ++ci) {
+        const auto uci = static_cast<std::size_t>(ci);
+        if (tile_uj_[uci] != ci || tile_crow_[uci] != ci)
+            return "conduit rows out of link order";
+    }
+    return {};
+}
+
+step::Arrays DWSolver::deviceArrays(SimulationContext& ctx) {
+    step::Arrays A;
+    A.n_nodes = n_nodes_;
+    A.n_conduits = n_conduits_;
+    A.surcharge_method = static_cast<int>(surcharge_method);
+    A.omega = omega;
+    A.normal_flow_ltd = ctx.options.normal_flow_ltd;
+    A.inertial_damping = ctx.options.inertial_damping;
+    A.head_tol = head_tol;
+    A.min_surf_area = min_surf_area_;
+    A.allow_ponding = ctx.options.allow_ponding ? 1 : 0;
+
+    A.node_invert = ctx.nodes.invert_elev.data();
+    A.node_is_outfall = device_outfalls_.is_outfall.data();
+    A.node_outfall_flap = device_outfalls_.flap.data();
+    A.node_outfall_link = device_outfalls_.link.data();
+    A.node_outfall_type = device_outfalls_.type.data();
+    A.node_outfall_offset = device_outfalls_.offset.data();
+    A.node_outfall_stage = device_outfalls_.stage.data();
+
+    A.n_csr = static_cast<int>(csr_link_.size());
+    A.csr_row = csr_row_.data();
+    A.csr_link = csr_link_.data();
+    A.csr_is_n2 = csr_is_n2_.data();
+
+    const auto& nd = ctx.nodes;
+    A.node_old_depth = nd.old_depth.data();
+    A.node_old_volume = nd.old_volume.data();
+    A.node_old_net_inflow = nd.old_net_inflow.data();
+    A.node_lat_flow = nd.lat_flow.data();
+    A.node_losses = nd.losses.data();
+    A.node_full_depth = nd.full_depth.data();
+    A.node_crown_elev = nd.crown_elev.data();
+    A.node_ponded_area = nd.ponded_area.data();
+    A.node_sur_depth = nd.sur_depth.data();
+    A.node_rpt_full_volume = nd.rpt_full_volume.data();
+    A.node_degree = nd.degree.data();
+
+    A.conduit_link = tile_uj_.data();
+    A.conduit_n1 = tile_n1_.data();
+    A.conduit_n2 = tile_n2_.data();
+    A.conduit_shape = tile_xsect_batch_shape_.data();
+    A.conduit_has_offset = tile_has_offset_.data();
+    A.conduit_offset1 = tile_z1_off_.data();
+    A.conduit_offset2 = tile_z2_off_.data();
+    A.conduit_y_full = tile_y_full_.data();
+    A.conduit_a_full = tile_a_full_.data();
+    A.conduit_r_full = tile_r_full_.data();
+    A.conduit_w_max = tile_w_max_.data();
+    A.conduit_s_full = ctx.links.xsect_s_full.data();
+    A.conduit_s_max = ctx.links.xsect_s_max.data();
+    A.conduit_length = tile_length_.data();
+    A.conduit_beta = tile_beta_.data();
+    A.conduit_q_max = tile_q_max_.data();
+    A.conduit_links_length = tile_links_length_.data();
+    A.conduit_mod_length = ctx.link_subtypes.conduits.mod_length.data();
+    A.conduit_rough_factor = tile_rough_factor_.data();
+    A.conduit_barrels = tile_barrels_d_.data();
+    A.conduit_is_closed = tile_is_closed_.data();
+    A.conduit_has_losses = tile_has_losses_.data();
+    A.conduit_loss_inlet = tile_loss_inlet_.data();
+    A.conduit_loss_outlet = tile_loss_outlet_.data();
+    A.conduit_loss_avg = tile_loss_avg_.data();
+    A.conduit_q_limit = tile_q_limit_.data();
+    A.conduit_has_flap_gate = tile_has_flap_gate_.data();
+    A.conduit_direction = tile_direction_.data();
+
+    A.conduit_setting = ctx.links.setting.data();
+    A.conduit_old_flow = ctx.links.old_flow.data();
+    A.area_old = area_old_.data();
+
+    A.node_depth = ctx.nodes.depth.data();
+    A.node_head = ctx.nodes.head.data();
+    A.node_volume = ctx.nodes.volume.data();
+    A.node_overflow = ctx.nodes.overflow.data();
+    A.node_held_volume = ctx.nodes.held_volume.data();
+    A.node_inflow = ctx.nodes.inflow.data();
+    A.node_outflow = ctx.nodes.outflow.data();
+    A.node_converged = xnode_.converged.data();
+    A.node_sumdqdh = xnode_.sumdqdh.data();
+    A.node_new_surf_area = xnode_.new_surf_area.data();
+    A.node_old_surf_area = xnode_.old_surf_area.data();
+    A.node_is_surcharged = xnode_.is_surcharged.data();
+    A.node_dydt = xnode_.dYdT.data();
+    A.conduit_q1 = q1_.data();
+    A.conduit_bypassed = bypassed_.data();
+
+    A.depth1 = depth1_.data();
+    A.depth2 = depth2_.data();
+    A.depth_mid = depth_mid_.data();
+    A.h1 = h1_.data();
+    A.h2 = h2_.data();
+    A.fasnh = fasnh_.data();
+    A.width1 = width1_.data();
+    A.width2 = width2_.data();
+    A.width_mid = width_mid_.data();
+    A.surf_area1 = surf_area1_.data();
+    A.surf_area2 = surf_area2_.data();
+    A.area1 = area1_.data();
+    A.area2 = area2_.data();
+    A.area_mid = area_mid_.data();
+    A.hrad1 = hrad1_.data();
+    A.hrad_mid = hrad_mid_.data();
+    // FlowClass is an int8_t enumeration, stored as the kernels' codes.
+    A.flow_class = reinterpret_cast<std::int8_t*>(ctx.links.flow_class.data());
+    A.wcap_d1 = wcap_d1_.data();
+    A.wcap_d2 = wcap_d2_.data();
+    A.wcap_dm = wcap_dm_.data();
+
+    // In scope, conduit c is link c and ConduitData row c (deviceScope).
+    A.link_flow = ctx.links.flow.data();
+    A.link_dqdh = ctx.links.dqdh.data();
+    A.link_depth = ctx.links.depth.data();
+    A.link_volume = ctx.links.volume.data();
+    A.new_flow = new_flow_.data();
+    A.dqdh = dqdh_.data();
+    A.velocity = velocity_.data();
+    A.froude = froude_.data();
+    A.sigma = sigma_.data();
+    static_assert(sizeof(MomentumCategory) == sizeof(std::uint8_t) &&
+                      static_cast<std::uint8_t>(MomentumCategory::SKIP_DRY) == step::kSkipDry &&
+                      static_cast<std::uint8_t>(MomentumCategory::MANNING_OPEN) ==
+                          step::kManningOpen &&
+                      static_cast<std::uint8_t>(MomentumCategory::MANNING_CLOSED_FS) ==
+                          step::kManningClosedFs &&
+                      static_cast<std::uint8_t>(MomentumCategory::MANNING_CLOSED_FULL) ==
+                          step::kManningClosedFull,
+                  "step::k* momentum codes must match MomentumCategory");
+    A.category = reinterpret_cast<std::uint8_t*>(category_.data());
+    auto& conduits = ctx.link_subtypes.conduits;
+    A.full_state = conduits.full_state.data();
+    A.inlet_control = conduits.inlet_control.data();
+    A.normal_flow_limited = conduits.normal_flow_limited.data();
+
+    A.tables = step::hostTables();
+    return A;
+}
+
+void DWSolver::attachDeviceMarcher(std::shared_ptr<IDwDeviceMarcher> marcher,
+                                   const SimulationContext& ctx) {
+    device_.reset();
+    if (!marcher)
+        return;
+    static_assert(step::kOutfallFree == static_cast<int>(OutfallType::FREE) &&
+                      step::kOutfallNormal == static_cast<int>(OutfallType::NORMAL) &&
+                      step::kOutfallFixed == static_cast<int>(OutfallType::FIXED),
+                  "step::kOutfall* codes must match OutfallType");
+    const auto nn = static_cast<std::size_t>(n_nodes_);
+    DeviceOutfalls& o = device_outfalls_;
+    o.is_outfall.assign(nn, 0);
+    o.flap.assign(nn, 0);
+    o.link.assign(nn, -1);
+    o.type.assign(nn, step::kOutfallFree);
+    o.offset.assign(nn, 0.0);
+    o.stage.assign(nn, 0.0);
+    // deviceScope() has checked every outfall has a row of type FREE, NORMAL or FIXED; the
+    // outfall-to-link map (outfall::buildOutfallLinkMap) is built before init().
+    const auto& outs = ctx.node_subtypes.outfalls;
+    for (int i = 0; i < n_nodes_; ++i) {
+        const auto ui = static_cast<std::size_t>(i);
+        if (ctx.nodes.type[ui] != NodeType::OUTFALL)
+            continue;
+        o.is_outfall[ui] = 1;
+        const auto r = static_cast<std::size_t>(ctx.node_subtypes.outfall_row(i));
+        o.flap[ui] = outs.has_flap_gate[r] ? 1 : 0;
+        o.link[ui] = outs.link_idx[r];
+        o.type[ui] = static_cast<int>(outs.bc_type[r]);
+        o.offset[ui] = outs.link_offset[r];
+        o.stage[ui] = outs.param[r];
+    }
+    DwDeviceNetwork network;
+    network.host = deviceArrays(const_cast<SimulationContext&>(ctx));
+    marcher->bind(network);
+    device_ = std::move(marcher);
+}
+
+bool DWSolver::deviceStepAllowed(SimulationContext& ctx) {
+    const char* why = nullptr;
+    for (std::size_t i = 0; i < ctx.coupled_node.size() && !why; ++i)
+        if (ctx.coupled_node[i])
+            why = "a 2D-coupled node";
+    if (!why && !ctx.surface_outfall_link_limit.empty())
+        why = "2D surface outfall coupling";
+    const auto& ramp = ctx.node_subtypes.outfalls.ramp_2d;
+    for (std::size_t r = 0; r < ramp.size() && !why; ++r)
+        if (ramp[r] > 0.0)
+            why = "a 2D tailwater at an outfall";
+    const auto& f = ctx.forcing;
+    for (std::size_t i = 0; i < f.node_head_boundary_mode.size() && !why; ++i)
+        if (f.node_head_boundary_mode[i] == ForcingMode::OVERRIDE &&
+            ctx.nodes.type[i] == NodeType::OUTFALL)
+            why = "an outfall stage forced through the API";
+    for (std::size_t j = 0; j < f.link_seepage_mode.size() && !why; ++j)
+        if (f.link_seepage_mode[j] != ForcingMode::NONE)
+            why = "conduit seepage forced through the API";
+    const auto& gw = ctx.link_subtypes.conduits.gw_coupled;
+    for (std::size_t r = 0; r < gw.size() && !why; ++r)
+        if (gw[r])
+            why = "an aquifer-coupled conduit";
+    if (!why)
+        return true;
+
+    std::string token = device_->label();
+    for (char& c : token)
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    ctx.warnings.push_back(
+        format_warning(WARN_DW_BACKEND_CPU, token, std::string("(") + why + " during the run)"));
+    device_.reset();
+    return false;
+}
+
+int DWSolver::executeOnDevice(SimulationContext& ctx, double dt, bool& converged) {
+    DwDeviceStep step;
+    step.dt = dt;
+    step.max_trials = max_trials;
+    step.host = deviceArrays(ctx);
+    const DwDeviceResult r = device_->execute(step);
+    if (!r.ok)
+        throw std::runtime_error(std::string("dynamic wave device loop failed: ") +
+                                 (r.error ? r.error : "unknown error"));
+    converged = r.converged;
+    return r.iterations;
 }
 
 } // namespace dynwave

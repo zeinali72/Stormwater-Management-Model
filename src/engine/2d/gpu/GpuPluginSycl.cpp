@@ -121,3 +121,8 @@ extern "C" OPENSWMM_GPU_ABI void* openswmm_make_gpu_network_marcher(const OpenSw
     (void)probe;
     return openswmm::twoD::gpu::plugin::makeNetworkMarcher([] { ensureKokkosInitialized(); });
 }
+
+extern "C" OPENSWMM_GPU_ABI void* openswmm_make_gpu_dw_marcher(const OpenSwmmGpuProbe* probe) {
+    (void)probe;
+    return openswmm::twoD::gpu::plugin::makeDwMarcher([] { ensureKokkosInitialized(); });
+}

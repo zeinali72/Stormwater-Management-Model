@@ -55,3 +55,8 @@ openswmm_make_gpu_explicit_solver(const OpenSwmmGpuProbe* /*probe*/) {
     // The Kokkos/CUDA/HIP/SYCL solver is not implemented until Phase 2.
     return nullptr;
 }
+
+extern "C" OPENSWMM_GPU_ABI void* openswmm_make_gpu_dw_marcher(const OpenSwmmGpuProbe* /*probe*/) {
+    // No device: the dynamic wave solver runs on the CPU.
+    return nullptr;
+}

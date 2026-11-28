@@ -45,12 +45,14 @@
 #define OPENSWMM_DYNAMIC_WAVE_HPP
 
 #include "XSectBatch.hpp"
+#include "dw/DwStepArrays.hpp"
 #include "../core/Constants.hpp"
 #include "../core/SimulationOptions.hpp"
 #include "../data/NodeData.hpp"
 #include "../data/LinkData.hpp"
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <cstdio>
 #include <vector>
@@ -61,6 +63,8 @@ struct SimulationContext;
 class Router;
 
 namespace dynwave {
+
+class IDwDeviceMarcher;
 
 // ============================================================================
 // Constants — imported from global Constants.hpp
@@ -364,6 +368,35 @@ public:
     /// solveMomentumBatch can recompute dq6 per Picard iteration (Gap #14).
     double evap_rate = 0.0;
 
+    /**
+     * @brief Say why the device Picard loop cannot run this model.
+     *
+     * The device path covers junctions and FREE, NORMAL or FIXED outfalls, conduits of CIRCULAR
+     * or RECT_CLOSED section with one barrel, SURCHARGE_METHOD EXTRAN or SLOT and EXPLICIT node
+     * continuity. Requires a completed init().
+     *
+     * @param[in] ctx The context init() was given.
+     * @return Empty when the model is in scope, else the first thing outside it, e.g.
+     *     "conduit C1 is not CIRCULAR or RECT_CLOSED".
+     */
+    std::string deviceScope(const SimulationContext& ctx) const;
+
+    /**
+     * @brief Bind a device marcher to this network and run every later Picard loop on it.
+     *
+     * Requires a completed init() and an empty deviceScope(). The marcher copies the static
+     * network now; every execute() then copies the step's state in and out. Exceptions from the
+     * marcher's bind() propagate, and the solver keeps the CPU loop.
+     *
+     * @param[in] marcher Plugin marcher; null detaches.
+     * @param[in] ctx The context init() was given.
+     */
+    void attachDeviceMarcher(std::shared_ptr<IDwDeviceMarcher> marcher,
+                             const SimulationContext& ctx);
+
+    /// True while a device marcher runs the Picard loop.
+    bool hasDeviceMarcher() const noexcept { return static_cast<bool>(device_); }
+
 private:
     friend class ::openswmm::Router; // explicit internal checkpoint fields only
     int n_nodes_ = 0;
@@ -371,6 +404,52 @@ private:
     int n_conduits_ = 0;
     int num_threads_ = 1; ///< OpenMP thread count for parallel loops
     const XSectGroups* groups_ = nullptr;
+
+    /// Device Picard loop (DwDeviceMarcher.hpp); null runs the CPU loop.
+    std::shared_ptr<IDwDeviceMarcher> device_;
+    /// Outfall boundaries by node, for the device path's static arrays (step::Arrays).
+    struct DeviceOutfalls {
+        std::vector<uint8_t> is_outfall; ///< 1 for an OUTFALL node
+        std::vector<uint8_t> flap;       ///< 1 for an outfall with a flap gate
+        std::vector<int> link;           ///< OutfallData::link_idx; -1 for none
+        std::vector<int> type;           ///< step::kOutfallFree, kOutfallNormal or kOutfallFixed
+        std::vector<double> offset;      ///< OutfallData::link_offset, ft
+        std::vector<double> stage;       ///< FIXED stage (OutfallData::param), ft
+    };
+    DeviceOutfalls device_outfalls_;
+
+    /**
+     * @brief Point a step::Arrays at this solver's arrays and the context's.
+     *
+     * Valid only for a model in deviceScope(), where conduit c is link c and ConduitData row c.
+     *
+     * @param[in,out] ctx The context init() was given.
+     * @return Host pointers to the static network and the routing state.
+     */
+    step::Arrays deviceArrays(SimulationContext& ctx);
+
+    /**
+     * @brief Check the run-time inputs the device loop does not cover, before a step.
+     *
+     * Forcings, 2D coupling and aquifer exchange can appear after init(). The first time one
+     * does, the marcher is detached, the run carries WARNING 111, and the CPU loop runs from that
+     * step on.
+     *
+     * @param[in,out] ctx Context of the step about to run.
+     * @return True when the device loop may run this step.
+     */
+    bool deviceStepAllowed(SimulationContext& ctx);
+
+    /**
+     * @brief Run the Picard loop of one routing step on the device marcher.
+     *
+     * @param[in,out] ctx Context of the step.
+     * @param[in] dt Routing step, s.
+     * @param[out] converged The last iteration's convergence.
+     * @return Picard iterations performed.
+     * @throws std::runtime_error When the marcher fails.
+     */
+    int executeOnDevice(SimulationContext& ctx, double dt, bool& converged);
 
     /// True if any conduit has a nonzero seepage rate (set once in init()).
     /// With zero evaporation this gates the bit-exact dead-work skip of

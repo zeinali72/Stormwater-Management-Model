@@ -48,7 +48,10 @@
 #include "../hydrology/LidNode.hpp"
 
 #include <cmath>
+#include <cctype>
 #include <algorithm>
+#include <cstdio>
+#include <exception>
 #include <fstream>
 #include <iomanip>
 
@@ -510,6 +513,48 @@ void Router::init(SimulationContext& ctx, RouteModel model) {
         dw_solver_.tpa_celerity = ctx.options.tpa_celerity; // #156
 
         dw_solver_.init(n_nodes, n_links, groups_, ctx);
+        dw_solver_.attachDeviceMarcher(nullptr, ctx);
+
+        // DW_BACKEND: OMP, CUDA, HIP or SYCL runs the Picard loop on the
+        // plugin's device marcher (dw/DwDeviceMarcher.hpp) when the model is
+        // inside its scope and the plugin is usable; otherwise the CPU solver
+        // runs and the run says why, once. AUTO stays on the CPU, as
+        // FV_BACKEND AUTO does. OPENSWMM_DW_BACKEND overrides the option as
+        // OPENSWMM_FV_BACKEND overrides FV_BACKEND; an unrecognised value acts
+        // as CPU.
+        fv::Backend dw_backend = ctx.options.dw_backend;
+        if (const char* env = std::getenv("OPENSWMM_DW_BACKEND"); env && *env) {
+            std::string token(env);
+            for (char& c : token)
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            if (!parseDwBackend(token, dw_backend))
+                dw_backend = fv::Backend::CPU;
+        }
+        if (dw_backend != fv::Backend::CPU && dw_backend != fv::Backend::AUTO) {
+            const std::string token = dwBackendToken(dw_backend);
+            std::string why = dw_solver_.deviceScope(ctx);
+            if (!why.empty()) {
+                why = "outside its scope: " + why;
+            } else {
+                std::string backend = token, label;
+                for (char& c : backend)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                try {
+                    auto marcher =
+                        fv::makeDwDeviceMarcher(backend, ctx.options.num_threads, &label, &why);
+                    if (marcher) {
+                        dw_solver_.attachDeviceMarcher(std::move(marcher), ctx);
+                        std::fprintf(stderr, "[openswmm DW] using device backend: %s\n",
+                                     label.c_str());
+                    }
+                } catch (const std::exception& error) {
+                    dw_solver_.attachDeviceMarcher(nullptr, ctx);
+                    why = std::string("the device marcher failed: ") + error.what();
+                }
+            }
+            if (!dw_solver_.hasDeviceMarcher())
+                ctx.warnings.push_back(format_warning(WARN_DW_BACKEND_CPU, token, "(" + why + ")"));
+        }
         break;
     }
     case RouteModel::FV: {
