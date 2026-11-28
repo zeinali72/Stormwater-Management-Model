@@ -1,0 +1,13 @@
+[CONTROLS]
+;; Rules for geometry_us.inp: conduit CB2 is closed from 1.0 h to 1.75 h of simulation time, and
+;; conduit CA3 while junction J3 is more than 0.8 ft deep. A closed conduit has setting 0.
+RULE CB2_WINDOW
+IF SIMULATION TIME > 1.0
+AND SIMULATION TIME < 1.75
+THEN CONDUIT CB2 STATUS = CLOSED
+ELSE CONDUIT CB2 STATUS = OPEN
+
+RULE CA3_ON_J3
+IF NODE J3 DEPTH > 0.8
+THEN CONDUIT CA3 STATUS = CLOSED
+ELSE CONDUIT CA3 STATUS = OPEN

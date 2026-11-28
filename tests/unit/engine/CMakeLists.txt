@@ -1049,6 +1049,31 @@ if(OPENSWMM_BUILD_GPU_PLUGIN AND OPENSWMM_GPU_BACKEND STREQUAL "omp" AND TARGET 
         set_tests_properties(test_engine_dw_device_${_case}_courant_t4 PROPERTIES
             LABELS "unit;gpu;parity" TIMEOUT 300 RUN_SERIAL TRUE)
     endforeach()
+    # State the host changes between routing steps: a hot start saved at 01:30 and a second run
+    # restarted from it, and control rules that close and reopen conduits during the run.
+    add_test(NAME test_engine_dw_device_geometry_si_hotstart_restart_t1
+        COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/tests/gpu/check_dw_device_identity.py
+            --engine $<TARGET_FILE:openswmm>
+            --plugin-dir $<TARGET_FILE_DIR:openswmm_gpu_omp>
+            --input ${_dw_device_geometry_si}
+            --threads 1
+            --hotstart-restart "01/01/2024 01:30:00"
+            --report-all
+            --output ${CMAKE_CURRENT_BINARY_DIR}/dw_device_geometry_si_hotstart_restart_t1)
+    add_test(NAME test_engine_dw_device_geometry_us_controls_t1
+        COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/tests/gpu/check_dw_device_identity.py
+            --engine $<TARGET_FILE:openswmm>
+            --plugin-dir $<TARGET_FILE_DIR:openswmm_gpu_omp>
+            --input ${_dw_device_geometry_us}
+            --threads 1
+            --append ${CMAKE_CURRENT_SOURCE_DIR}/data/dw_kernels_geometry/geometry_us_controls.txt
+            --report-all
+            --output ${CMAKE_CURRENT_BINARY_DIR}/dw_device_geometry_us_controls_t1)
+    set_tests_properties(test_engine_dw_device_geometry_si_hotstart_restart_t1
+        test_engine_dw_device_geometry_us_controls_t1 PROPERTIES
+        LABELS "unit;gpu;parity" TIMEOUT 300)
     add_test(NAME test_engine_dw_device_refuses_example1
         COMMAND ${Python3_EXECUTABLE}
             ${PROJECT_SOURCE_DIR}/tests/gpu/check_dw_device_identity.py
