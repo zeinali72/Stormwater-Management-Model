@@ -74,6 +74,7 @@ using Pinned = Kokkos::View<unsigned char*, Kokkos::SharedHostPinnedSpace>;
 using DevBytes = Kokkos::View<unsigned char*, MemSpace, Kokkos::MemoryUnmanaged>;
 using PinnedBytes =
     Kokkos::View<unsigned char*, Kokkos::SharedHostPinnedSpace, Kokkos::MemoryUnmanaged>;
+using Ints = Kokkos::View<int*, MemSpace>;
 
 #if defined(OPENSWMM_GPU_EXECSPACE_CUDA)
 constexpr const char* kLabel = "cuda";
@@ -219,6 +220,8 @@ private:
     Bytes block_;               ///< every device array
     Pinned mirror_;             ///< what the device holds, on the host
     step::Arrays d_{};          ///< every pointer is into block_
+    Ints outfall_nodes_;        ///< nodes whose depth a conduit sets, ascending
+    int n_outfall_nodes_ = 0;   ///< entries of outfall_nodes_
     std::vector<int> outfalls_; ///< every OUTFALL node, ascending (Sync::Outfalls)
 
     Pinned stage_;    ///< [node lateral inflows][Delta...], on the host
@@ -418,10 +421,25 @@ void KokkosDwMarcher::uploadAll(const step::Arrays& h) {
     Kokkos::deep_copy(DevBytes(block_.data(), block_.extent(0)),
                       PinnedBytes(mirror_.data(), mirror_.extent(0)));
 
+    // Node lists: the outfalls a conduit sets (the outfall boundary kernel), and every outfall.
+    const int nn = d_.n_nodes;
+    std::vector<int> linked;
     outfalls_.clear();
-    for (int i = 0; i < d_.n_nodes; ++i)
+    for (int i = 0; i < nn; ++i) {
+        if (h.node_outfall_link[i] >= 0)
+            linked.push_back(i);
         if (h.node_is_outfall[i])
             outfalls_.push_back(i);
+    }
+    n_outfall_nodes_ = static_cast<int>(linked.size());
+    outfall_nodes_ =
+        Ints(Kokkos::view_alloc(std::string("dw_outfall_nodes"), Kokkos::WithoutInitializing),
+             linked.empty() ? 1 : linked.size());
+    if (!linked.empty())
+        Kokkos::deep_copy(Kokkos::View<int*, MemSpace, Kokkos::MemoryUnmanaged>(
+                              outfall_nodes_.data(), linked.size()),
+                          Kokkos::View<const int*, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(
+                              linked.data(), linked.size()));
 }
 
 void KokkosDwMarcher::stageField(const Field& f, const void* host, const unsigned char* ref,
@@ -589,9 +607,10 @@ int KokkosDwMarcher::nodeDepths(double dt, int iteration) {
 
 void KokkosDwMarcher::outfallDepths() {
     const step::Arrays D = d_;
+    const int* const nodes = outfall_nodes_.data();
     Kokkos::parallel_for(
-        "dw_outfall_depths", Range(0, D.n_nodes),
-        KOKKOS_LAMBDA(const int i) { step::outfallDepth(D, i); });
+        "dw_outfall_depths", Range(0, n_outfall_nodes_),
+        KOKKOS_LAMBDA(const int k) { step::outfallDepth(D, nodes[k]); });
 }
 
 void KokkosDwMarcher::bypass() {
