@@ -526,8 +526,8 @@ static void apply_option_2d(SimulationContext& ctx, const std::string& key,
 static void read_options(sqlite3* db, SimulationContext& ctx, const std::string& sim_id) {
     auto stmt = prepare(db, "SELECT key, value FROM options WHERE simulation_id = ?");
     bind_text(stmt.get(), 1, sim_id);
-    // Finite volume rows are [OPTIONS] tokens (FvOptionRows.hpp); they are
-    // collected here and parsed by the input file's own option handler.
+    // Finite volume rows and DW_BACKEND are [OPTIONS] tokens (FvOptionRows.hpp);
+    // they are collected here and parsed by the input file's own option handler.
     std::vector<std::string> fv_lines;
 
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
@@ -699,18 +699,21 @@ static void read_options(sqlite3* db, SimulationContext& ctx, const std::string&
             ctx.spatial.map_y2 = std::stod(val);
         else if (key.rfind("2D_", 0) == 0)
             apply_option_2d(ctx, key, val);
-        else if (key.rfind("FV_", 0) == 0)
+        else if (key.rfind("FV_", 0) == 0 || key == "DW_BACKEND")
             fv_lines.push_back(key + " " + val);
     }
     if (!fv_lines.empty()) {
         // The parser also finishes the whole [OPTIONS] section: lines without a
         // report start date reset the report start to the start date. Keep
-        // every option read above and take only the finite volume options.
+        // every option read above and take only the finite volume options and
+        // DW_BACKEND.
         const SimulationOptions read_so_far = ctx.options;
         input::handle_options(ctx, fv_lines);
         const auto fv = ctx.options.fv;
+        const auto dw_backend = ctx.options.dw_backend;
         ctx.options = read_so_far;
         ctx.options.fv = fv;
+        ctx.options.dw_backend = dw_backend;
     }
 }
 

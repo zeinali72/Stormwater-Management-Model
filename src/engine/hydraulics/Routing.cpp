@@ -48,6 +48,7 @@
 #include "../hydrology/LidNode.hpp"
 
 #include <cmath>
+#include <cctype>
 #include <algorithm>
 #include <fstream>
 #include <iomanip>
@@ -510,6 +511,21 @@ void Router::init(SimulationContext& ctx, RouteModel model) {
         dw_solver_.tpa_celerity = ctx.options.tpa_celerity; // #156
 
         dw_solver_.init(n_nodes, n_links, groups_, ctx);
+
+        // DW_BACKEND: there is no device dynamic wave solver yet, so every
+        // backend runs the CPU solver and a device request says so once.
+        // OPENSWMM_DW_BACKEND overrides the option as OPENSWMM_FV_BACKEND
+        // overrides FV_BACKEND; an unrecognised value acts as CPU.
+        fv::Backend dw_backend = ctx.options.dw_backend;
+        if (const char* env = std::getenv("OPENSWMM_DW_BACKEND"); env && *env) {
+            std::string token(env);
+            for (char& c : token)
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            if (!parseDwBackend(token, dw_backend))
+                dw_backend = fv::Backend::CPU;
+        }
+        if (dw_backend != fv::Backend::CPU && dw_backend != fv::Backend::AUTO)
+            ctx.warnings.push_back(format_warning(WARN_DW_BACKEND_CPU, dwBackendToken(dw_backend)));
         break;
     }
     case RouteModel::FV: {

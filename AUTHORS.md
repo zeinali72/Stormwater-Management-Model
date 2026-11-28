@@ -19,6 +19,9 @@ OpenSWMM is built on the EPA SWMM 5.x foundation and extended by the contributor
   spatial fields, 1D network ROM, cross-layer coupling) is in progress on a feature
   branch and is not yet part of a release.
 
+- **Farzan Zeinali** @zeinali72 -- The `[OPTIONS] DW_BACKEND` key for dynamic wave routing
+  and WARNING 111.
+
 - **GitHub Copilot coding agent** -- `swmm_NODE_OUTFLOW` in the `getNodeValue` API and
   both binding trees (PR #85), and Error 227 for zero channel Manning's *n* in the
   transect reader, in both the legacy and refactored engines (PR #77).
