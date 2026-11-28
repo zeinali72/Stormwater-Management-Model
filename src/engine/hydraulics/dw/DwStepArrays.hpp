@@ -94,8 +94,8 @@ struct Arrays {
     int allow_ponding = 0;      ///< SimulationOptions::allow_ponding
 
     // ---- nodes (static) ---------------------------------------------------
-    const double* node_invert = nullptr;           ///< NodeData::invert_elev, ft
-    const std::uint8_t* node_is_outfall = nullptr; ///< 1 for an OUTFALL node
+    const double* node_invert = nullptr;             ///< NodeData::invert_elev, ft
+    const std::uint8_t* node_is_outfall = nullptr;   ///< 1 for an OUTFALL node
     const std::uint8_t* node_outfall_flap = nullptr; ///< 1 for an OUTFALL node with a flap gate
     const int* node_outfall_link = nullptr;      ///< link setting an outfall's depth; -1 for none
     const int* node_outfall_type = nullptr;      ///< kOutfallFree, kOutfallNormal or kOutfallFixed
@@ -134,9 +134,9 @@ struct Arrays {
     const double* conduit_w_max = nullptr;            ///< LinkData::xsect_w_max, ft
     const double* conduit_s_full = nullptr;           ///< LinkData::xsect_s_full, ft^(8/3)
     const double* conduit_s_max = nullptr;            ///< LinkData::xsect_s_max, ft^(8/3)
-    const double* conduit_length = nullptr; ///< modified length (mod_length, else length), ft
-    const double* conduit_beta = nullptr;   ///< ConduitData::beta
-    const double* conduit_q_max = nullptr;  ///< ConduitData::q_max, per barrel, cfs
+    const double* conduit_length = nullptr;       ///< modified length (mod_length, else length), ft
+    const double* conduit_beta = nullptr;         ///< ConduitData::beta
+    const double* conduit_q_max = nullptr;        ///< ConduitData::q_max, per barrel, cfs
     const double* conduit_links_length = nullptr; ///< routing length (true_length, else length), ft
     const double* conduit_mod_length = nullptr;   ///< ConduitData::mod_length, ft
     const double* conduit_rough_factor = nullptr; ///< ConduitData::rough_factor
