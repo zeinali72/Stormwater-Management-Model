@@ -18,12 +18,19 @@
  * @file      KokkosDwMarcher.cpp
  * @brief     Kokkos Picard loop of the classic dynamic wave solver.
  *
- * @details One execute() is: copy the routing step's state to the device, run the Picard
- *          iterations there, copy the state back. The loop is DWSolver::execute's, and the
- *          per-element work is DwKernels.hpp compiled with OPENSWMM_KERNEL_FN =
- *          KOKKOS_INLINE_FUNCTION. Every kernel writes only the element it is called with, so the
- *          result does not depend on the thread count; the one reduction, the count of
- *          unconverged nodes, is an integer.
+ * @details The loop is DWSolver::execute's, and the per-element work is DwKernels.hpp compiled
+ *          with OPENSWMM_KERNEL_FN = KOKKOS_INLINE_FUNCTION. Every kernel writes only the element
+ *          it is called with, so the result does not depend on the thread count; the one
+ *          reduction, the count of unconverged nodes, is an integer.
+ *
+ *          Every array lives in one device block, laid out by group: the public state first, then
+ *          the solver-only groups pull() returns, then the per-step inputs, then the static data.
+ *          A pinned host mirror of the block holds what the device holds. The first call after
+ *          bind() (DwDeviceStep::upload_all) packs every array into the mirror and uploads it in
+ *          one copy. Every later call compares the host's arrays bit for bit with the mirror and
+ *          uploads, in one copy of a pinned staging buffer, the lateral inflows and the changed
+ *          elements; a kernel scatters them into the block. execute() then downloads the public
+ *          state in one copy.
  *
  * @see ../DwKernels.hpp, ../DwDeviceMarcher.hpp
  * @ingroup engine_hydraulics
@@ -45,9 +52,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <iterator>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace openswmm::dynwave::gpu {
@@ -59,8 +70,10 @@ using twoD::gpu::MemSpace;
 
 using Range = Kokkos::RangePolicy<ExecSpace>;
 using Bytes = Kokkos::View<unsigned char*, MemSpace>;
+using Pinned = Kokkos::View<unsigned char*, Kokkos::SharedHostPinnedSpace>;
 using DevBytes = Kokkos::View<unsigned char*, MemSpace, Kokkos::MemoryUnmanaged>;
-using HostBytes = Kokkos::View<unsigned char*, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>;
+using PinnedBytes =
+    Kokkos::View<unsigned char*, Kokkos::SharedHostPinnedSpace, Kokkos::MemoryUnmanaged>;
 
 #if defined(OPENSWMM_GPU_EXECSPACE_CUDA)
 constexpr const char* kLabel = "cuda";
@@ -72,29 +85,91 @@ constexpr const char* kLabel = "sycl";
 constexpr const char* kLabel = "omp";
 #endif
 
-/// One array the device holds, and the host array it is copied from and back to.
-struct Sync {
-    unsigned char* dev = nullptr;
-    unsigned char* host = nullptr;
-    std::size_t bytes = 0;
+/// Which part of the block an array is in, in block order.
+enum class Group : std::uint8_t {
+    Public,    ///< public state the host reads: downloaded after every execute()
+    Converged, ///< kDwPullConverged
+    LinkStep,  ///< kDwPullLinkStep
+    Rest,      ///< kDwPullRest
+    Input,     ///< per-step inputs: uploaded, never downloaded
+    Static,    ///< uploaded with upload_all only
 };
 
-/// The per-step node inputs of step::Arrays, copied to the device at every execute().
-using NodeInput = const double* step::Arrays::*;
-constexpr NodeInput kNodeInputs[] = {
-    &step::Arrays::node_old_depth,      &step::Arrays::node_old_volume,
-    &step::Arrays::node_old_net_inflow, &step::Arrays::node_lat_flow,
-    &step::Arrays::node_losses,         &step::Arrays::node_full_depth,
-    &step::Arrays::node_crown_elev,     &step::Arrays::node_ponded_area,
-    &step::Arrays::node_sur_depth,      &step::Arrays::node_rpt_full_volume};
+/// How a call after the first brings an array up to date with the host.
+enum class Sync : std::uint8_t {
+    None,      ///< not uploaded: the device's copy is the latest, or the loop writes it first
+    Compare,   ///< elements whose bits differ from the device's are uploaded
+    Outfalls,  ///< as Compare, at outfall nodes only
+    Dense,     ///< uploaded whole at every execute()
+    Derived,   ///< the device copies Field::ref's value into it first; then as Compare
+    NetInflow, ///< the device forms inflow - outflow into it first; then as Compare
+};
 
-/// Pair a device array with its host array; a null or empty host array is left out.
-template <class T> void pairOf(std::vector<Sync>& list, T* dev, const T* host, int n) {
-    if (dev == nullptr || host == nullptr || n <= 0)
-        return;
-    list.push_back({reinterpret_cast<unsigned char*>(dev),
-                    reinterpret_cast<unsigned char*>(const_cast<T*>(host)),
-                    static_cast<std::size_t>(n) * sizeof(T)});
+/// One array of the block.
+struct Field {
+    Group group = Group::Static;
+    Sync sync = Sync::None;
+    std::size_t elem = 0;   ///< bytes per element
+    std::size_t count = 0;  ///< elements
+    std::size_t offset = 0; ///< byte offset in the block
+    int ref = -1;           ///< Sync::Derived: index of the field copied
+    const void* (*host)(const step::Arrays&) = nullptr;
+    void (*point)(step::Arrays&, unsigned char*) = nullptr;
+};
+
+template <auto Member> Field field(Group group, Sync sync, std::size_t count) {
+    using Ptr =
+        std::remove_cv_t<std::remove_reference_t<decltype(std::declval<step::Arrays&>().*Member)>>;
+    using T = std::remove_const_t<std::remove_pointer_t<Ptr>>;
+    Field f;
+    f.group = group;
+    f.sync = sync;
+    f.elem = sizeof(T);
+    f.count = count;
+    f.host = [](const step::Arrays& a) -> const void* { return a.*Member; };
+    f.point = [](step::Arrays& a, unsigned char* p) { a.*Member = reinterpret_cast<T*>(p); };
+    return f;
+}
+
+template <auto Member> Field table(std::size_t count) {
+    using Ptr =
+        std::remove_cv_t<std::remove_reference_t<decltype(std::declval<step::Tables&>().*Member)>>;
+    using T = std::remove_const_t<std::remove_pointer_t<Ptr>>;
+    Field f;
+    f.elem = sizeof(T);
+    f.count = count;
+    f.host = [](const step::Arrays& a) -> const void* { return a.tables.*Member; };
+    f.point = [](step::Arrays& a, unsigned char* p) { a.tables.*Member = reinterpret_cast<T*>(p); };
+    return f;
+}
+
+/// One changed element: its byte offset in the block, with kByte set for a 1-byte element, and
+/// its new bits.
+struct Delta {
+    std::uint64_t at;
+    std::uint64_t bits;
+};
+constexpr std::uint64_t kByte = std::uint64_t{1} << 63;
+
+/// Every segment starts on this boundary, so that every element is aligned.
+constexpr std::size_t kAlign = 64;
+
+std::size_t aligned(std::size_t n) {
+    return (n + kAlign - 1) / kAlign * kAlign;
+}
+
+/// The kDwPull* bit of a solver-only group; 0 for the others.
+unsigned pullBit(Group g) {
+    switch (g) {
+    case Group::Converged:
+        return kDwPullConverged;
+    case Group::LinkStep:
+        return kDwPullLinkStep;
+    case Group::Rest:
+        return kDwPullRest;
+    default:
+        return 0;
+    }
 }
 
 } // namespace
@@ -114,6 +189,7 @@ public:
     void bind(const DwDeviceNetwork& network) override;
     DwDeviceResult execute(const DwDeviceStep& step) override;
     DwCourantResult courantStep(const DwCourantStep& in) override;
+    DwDeviceResult pull(const DwDevicePull& request) override;
     const char* label() const noexcept override { return kLabel; }
 
     // Public only for the reason above; not part of the interface.
@@ -124,235 +200,359 @@ public:
     int nodeDepths(double dt, int iteration);
     void outfallDepths();
     void bypass();
+    void startStep(bool derive, std::size_t deltas);
+    void scatter(std::size_t first, std::size_t count);
 
 private:
-    template <class T> T* alloc(const char* name, int n);
-    template <class T> T* upload(const char* name, const T* host, int n);
-    std::vector<Sync> stateOf(const step::Arrays& h) const;
-    std::vector<Sync> inputsOf(const step::Arrays& h) const;
-    std::vector<Sync> courantInputsOf(const step::Arrays& h) const;
-    static void push(const std::vector<Sync>& list);
-    static void pull(const std::vector<Sync>& list);
+    int add(Field f);
+    void uploadAll(const step::Arrays& h);
+    std::size_t stage(const step::Arrays& h, bool inputs);
+    void stageField(const Field& f, const void* host, const unsigned char* ref, bool net);
+    void download(std::size_t begin, std::size_t end);
     void report() const;
 
-    std::vector<Bytes> keep_; ///< owns every device array
-    step::Arrays d_{};        ///< every pointer is a device array
-    double* node_depth_ = nullptr;
-    double* q1_ = nullptr;
-    std::uint8_t* bypassed_ = nullptr;
-    double* setting_ = nullptr;
-    double* old_flow_ = nullptr;
-    double* area_old_ = nullptr;
-    std::vector<double*> node_inputs_; ///< device arrays of kNodeInputs, in its order
-    int* node_degree_ = nullptr;
+    std::vector<Field> fields_;
+    std::size_t public_end_ = 0;    ///< end of the Public group
+    std::size_t converged_end_ = 0; ///< end of the Converged group
+    int inflow_ = -1, outflow_ = -1;
+
+    Bytes block_;               ///< every device array
+    Pinned mirror_;             ///< what the device holds, on the host
+    step::Arrays d_{};          ///< every pointer is into block_
+    std::vector<int> outfalls_; ///< every OUTFALL node, ascending (Sync::Outfalls)
+
+    Pinned stage_;    ///< [node lateral inflows][Delta...], on the host
+    Bytes stage_dev_; ///< the same, on the device
+    std::vector<Delta> deltas_;
+
     long steps_ = 0;
     long iterations_ = 0;
+    long uploaded_ = 0; ///< changed elements uploaded, all calls
     std::string error_;
 };
 
-template <class T> T* KokkosDwMarcher::alloc(const char* name, int n) {
-    const std::size_t count = static_cast<std::size_t>(n > 0 ? n : 1);
-    keep_.emplace_back(Kokkos::view_alloc(std::string(name), Kokkos::WithoutInitializing),
-                       count * sizeof(T));
-    return reinterpret_cast<T*>(keep_.back().data());
-}
-
-template <class T> T* KokkosDwMarcher::upload(const char* name, const T* host, int n) {
-    T* dev = alloc<T>(name, n);
-    std::vector<Sync> one;
-    pairOf(one, dev, host, n);
-    push(one);
-    return dev;
-}
-
-void KokkosDwMarcher::push(const std::vector<Sync>& list) {
-    for (const Sync& s : list)
-        Kokkos::deep_copy(DevBytes(s.dev, s.bytes), HostBytes(s.host, s.bytes));
-}
-
-void KokkosDwMarcher::pull(const std::vector<Sync>& list) {
-    for (const Sync& s : list)
-        Kokkos::deep_copy(HostBytes(s.host, s.bytes), DevBytes(s.dev, s.bytes));
+int KokkosDwMarcher::add(Field f) {
+    fields_.push_back(f);
+    return static_cast<int>(fields_.size()) - 1;
 }
 
 void KokkosDwMarcher::bind(const DwDeviceNetwork& network) {
+    using A = step::Arrays;
     const step::Arrays& h = network.host;
-    const int nn = h.n_nodes, nc = h.n_conduits;
-    keep_.clear();
+    const auto nn = static_cast<std::size_t>(h.n_nodes);
+    const auto nc = static_cast<std::size_t>(h.n_conduits);
+    const auto ncsr = static_cast<std::size_t>(h.n_csr);
+    fields_.clear();
     d_ = step::Arrays{};
-    d_.n_nodes = nn;
-    d_.n_conduits = nc;
+    d_.n_nodes = h.n_nodes;
+    d_.n_conduits = h.n_conduits;
     d_.n_csr = h.n_csr;
     d_.surcharge_method = h.surcharge_method;
 
-    d_.node_invert = upload("dw_node_invert", h.node_invert, nn);
-    d_.node_is_outfall = upload("dw_node_is_outfall", h.node_is_outfall, nn);
-    d_.node_outfall_flap = upload("dw_node_outfall_flap", h.node_outfall_flap, nn);
-    d_.node_outfall_link = upload("dw_node_outfall_link", h.node_outfall_link, nn);
-    d_.node_outfall_type = upload("dw_node_outfall_type", h.node_outfall_type, nn);
-    d_.node_outfall_offset = upload("dw_node_outfall_offset", h.node_outfall_offset, nn);
-    d_.node_outfall_stage = upload("dw_node_outfall_stage", h.node_outfall_stage, nn);
-    d_.csr_row = upload("dw_csr_row", h.csr_row, nn + 1);
-    d_.csr_link = upload("dw_csr_link", h.csr_link, h.n_csr);
-    d_.csr_is_n2 = upload("dw_csr_is_n2", h.csr_is_n2, h.n_csr);
+    constexpr Group P = Group::Public, C = Group::Converged, L = Group::LinkStep, R = Group::Rest,
+                    I = Group::Input, S = Group::Static;
+    constexpr Sync none = Sync::None, cmp = Sync::Compare;
 
-    d_.conduit_link = upload("dw_conduit_link", h.conduit_link, nc);
-    d_.conduit_n1 = upload("dw_conduit_n1", h.conduit_n1, nc);
-    d_.conduit_n2 = upload("dw_conduit_n2", h.conduit_n2, nc);
-    d_.conduit_shape = upload("dw_conduit_shape", h.conduit_shape, nc);
-    d_.conduit_has_offset = upload("dw_conduit_has_offset", h.conduit_has_offset, nc);
-    d_.conduit_offset1 = upload("dw_conduit_offset1", h.conduit_offset1, nc);
-    d_.conduit_offset2 = upload("dw_conduit_offset2", h.conduit_offset2, nc);
-    d_.conduit_y_full = upload("dw_conduit_y_full", h.conduit_y_full, nc);
-    d_.conduit_a_full = upload("dw_conduit_a_full", h.conduit_a_full, nc);
-    d_.conduit_r_full = upload("dw_conduit_r_full", h.conduit_r_full, nc);
-    d_.conduit_w_max = upload("dw_conduit_w_max", h.conduit_w_max, nc);
-    d_.conduit_s_full = upload("dw_conduit_s_full", h.conduit_s_full, nc);
-    d_.conduit_s_max = upload("dw_conduit_s_max", h.conduit_s_max, nc);
-    d_.conduit_length = upload("dw_conduit_length", h.conduit_length, nc);
-    d_.conduit_beta = upload("dw_conduit_beta", h.conduit_beta, nc);
-    d_.conduit_q_max = upload("dw_conduit_q_max", h.conduit_q_max, nc);
-    d_.conduit_links_length = upload("dw_conduit_links_length", h.conduit_links_length, nc);
-    d_.conduit_mod_length = upload("dw_conduit_mod_length", h.conduit_mod_length, nc);
-    d_.conduit_rough_factor = upload("dw_conduit_rough_factor", h.conduit_rough_factor, nc);
-    d_.conduit_barrels = upload("dw_conduit_barrels", h.conduit_barrels, nc);
-    d_.conduit_is_closed = upload("dw_conduit_is_closed", h.conduit_is_closed, nc);
-    d_.conduit_has_losses = upload("dw_conduit_has_losses", h.conduit_has_losses, nc);
-    d_.conduit_loss_inlet = upload("dw_conduit_loss_inlet", h.conduit_loss_inlet, nc);
-    d_.conduit_loss_outlet = upload("dw_conduit_loss_outlet", h.conduit_loss_outlet, nc);
-    d_.conduit_loss_avg = upload("dw_conduit_loss_avg", h.conduit_loss_avg, nc);
-    d_.conduit_q_limit = upload("dw_conduit_q_limit", h.conduit_q_limit, nc);
-    d_.conduit_has_flap_gate = upload("dw_conduit_has_flap_gate", h.conduit_has_flap_gate, nc);
-    d_.conduit_direction = upload("dw_conduit_direction", h.conduit_direction, nc);
+    // Public state. A junction's overflow and every node's inflow and outflow are written by the
+    // loop before it reads them (step::junctionDepth, step::initNodeState).
+    const int depth = add(field<&A::node_depth>(P, cmp, nn));
+    add(field<&A::node_head>(P, cmp, nn));
+    const int volume = add(field<&A::node_volume>(P, cmp, nn));
+    add(field<&A::node_overflow>(P, Sync::Outfalls, nn));
+    add(field<&A::node_held_volume>(P, cmp, nn));
+    inflow_ = add(field<&A::node_inflow>(P, none, nn));
+    outflow_ = add(field<&A::node_outflow>(P, none, nn));
+    const int flow = add(field<&A::link_flow>(P, cmp, nc));
+    add(field<&A::link_dqdh>(P, cmp, nc));
+    add(field<&A::link_depth>(P, cmp, nc));
+    add(field<&A::link_volume>(P, cmp, nc));
+    add(field<&A::flow_class>(P, cmp, nc));
+    add(field<&A::full_state>(P, cmp, nc));
+    add(field<&A::inlet_control>(P, cmp, nc));
+    add(field<&A::normal_flow_limited>(P, cmp, nc));
 
-    // The shared geometry tables, copied to the device once.
+    // Solver-only state: the device's copy is the latest.
+    add(field<&A::node_converged>(C, none, nn));
+    add(field<&A::froude>(L, none, nc));
+    add(field<&A::area_mid>(L, none, nc));
+    add(field<&A::node_sumdqdh>(R, none, nn));
+    add(field<&A::node_new_surf_area>(R, none, nn));
+    add(field<&A::node_old_surf_area>(R, none, nn));
+    add(field<&A::node_dydt>(R, none, nn));
+    add(field<&A::node_is_surcharged>(R, none, nn));
+    add(field<&A::conduit_q1>(R, none, nc));
+    add(field<&A::conduit_bypassed>(R, none, nc));
+    add(field<&A::depth1>(R, none, nc));
+    add(field<&A::depth2>(R, none, nc));
+    add(field<&A::depth_mid>(R, none, nc));
+    add(field<&A::h1>(R, none, nc));
+    add(field<&A::h2>(R, none, nc));
+    add(field<&A::fasnh>(R, none, nc));
+    add(field<&A::width1>(R, none, nc));
+    add(field<&A::width2>(R, none, nc));
+    add(field<&A::width_mid>(R, none, nc));
+    add(field<&A::surf_area1>(R, none, nc));
+    add(field<&A::surf_area2>(R, none, nc));
+    add(field<&A::area1>(R, none, nc));
+    add(field<&A::area2>(R, none, nc));
+    add(field<&A::hrad1>(R, none, nc));
+    add(field<&A::hrad_mid>(R, none, nc));
+    add(field<&A::wcap_d1>(R, none, nc));
+    add(field<&A::wcap_d2>(R, none, nc));
+    add(field<&A::wcap_dm>(R, none, nc));
+    add(field<&A::new_flow>(R, none, nc));
+    add(field<&A::dqdh>(R, none, nc));
+    add(field<&A::velocity>(R, none, nc));
+    add(field<&A::sigma>(R, none, nc));
+    add(field<&A::category>(R, none, nc));
+    add(field<&A::area_old>(R, none, nc));
+
+    // Per-step inputs. The old values are the state at the step start (NodeData and LinkData
+    // save_hyd_state), which the device forms from its own state (startStep).
+    Field f = field<&A::node_old_depth>(I, Sync::Derived, nn);
+    f.ref = depth;
+    add(f);
+    f = field<&A::node_old_volume>(I, Sync::Derived, nn);
+    f.ref = volume;
+    add(f);
+    add(field<&A::node_old_net_inflow>(I, Sync::NetInflow, nn));
+    add(field<&A::node_lat_flow>(I, Sync::Dense, nn));
+    add(field<&A::node_losses>(I, cmp, nn));
+    add(field<&A::conduit_setting>(I, cmp, nc));
+    f = field<&A::conduit_old_flow>(I, Sync::Derived, nc);
+    f.ref = flow;
+    add(f);
+
+    // Static data.
+    add(field<&A::node_full_depth>(S, none, nn));
+    add(field<&A::node_crown_elev>(S, none, nn));
+    add(field<&A::node_ponded_area>(S, none, nn));
+    add(field<&A::node_sur_depth>(S, none, nn));
+    add(field<&A::node_rpt_full_volume>(S, none, nn));
+    add(field<&A::node_degree>(S, none, nn));
+    add(field<&A::node_invert>(S, none, nn));
+    add(field<&A::node_is_outfall>(S, none, nn));
+    add(field<&A::node_outfall_flap>(S, none, nn));
+    add(field<&A::node_outfall_link>(S, none, nn));
+    add(field<&A::node_outfall_type>(S, none, nn));
+    add(field<&A::node_outfall_offset>(S, none, nn));
+    add(field<&A::node_outfall_stage>(S, none, nn));
+    add(field<&A::csr_row>(S, none, nn + 1));
+    add(field<&A::csr_link>(S, none, ncsr));
+    add(field<&A::csr_is_n2>(S, none, ncsr));
+    add(field<&A::conduit_link>(S, none, nc));
+    add(field<&A::conduit_n1>(S, none, nc));
+    add(field<&A::conduit_n2>(S, none, nc));
+    add(field<&A::conduit_shape>(S, none, nc));
+    add(field<&A::conduit_has_offset>(S, none, nc));
+    add(field<&A::conduit_offset1>(S, none, nc));
+    add(field<&A::conduit_offset2>(S, none, nc));
+    add(field<&A::conduit_y_full>(S, none, nc));
+    add(field<&A::conduit_a_full>(S, none, nc));
+    add(field<&A::conduit_r_full>(S, none, nc));
+    add(field<&A::conduit_w_max>(S, none, nc));
+    add(field<&A::conduit_s_full>(S, none, nc));
+    add(field<&A::conduit_s_max>(S, none, nc));
+    add(field<&A::conduit_length>(S, none, nc));
+    add(field<&A::conduit_beta>(S, none, nc));
+    add(field<&A::conduit_q_max>(S, none, nc));
+    add(field<&A::conduit_links_length>(S, none, nc));
+    add(field<&A::conduit_mod_length>(S, none, nc));
+    add(field<&A::conduit_rough_factor>(S, none, nc));
+    add(field<&A::conduit_barrels>(S, none, nc));
+    add(field<&A::conduit_is_closed>(S, none, nc));
+    add(field<&A::conduit_has_losses>(S, none, nc));
+    add(field<&A::conduit_loss_inlet>(S, none, nc));
+    add(field<&A::conduit_loss_outlet>(S, none, nc));
+    add(field<&A::conduit_loss_avg>(S, none, nc));
+    add(field<&A::conduit_q_limit>(S, none, nc));
+    add(field<&A::conduit_has_flap_gate>(S, none, nc));
+    add(field<&A::conduit_direction>(S, none, nc));
+
+    // The shared geometry tables.
     const step::Tables& t = h.tables;
-    d_.tables.A_Circ = upload("dw_A_Circ", t.A_Circ, t.N_A_Circ);
-    d_.tables.R_Circ = upload("dw_R_Circ", t.R_Circ, t.N_R_Circ);
-    d_.tables.W_Circ = upload("dw_W_Circ", t.W_Circ, t.N_W_Circ);
-    d_.tables.S_Circ = upload("dw_S_Circ", t.S_Circ, t.N_S_Circ);
-    d_.tables.Y_Circ = upload("dw_Y_Circ", t.Y_Circ, t.N_Y_Circ);
-    d_.tables.Amax = upload("dw_Amax", t.Amax, static_cast<int>(std::size(xsect_tables::Amax)));
+    using T = step::Tables;
+    add(table<&T::A_Circ>(static_cast<std::size_t>(t.N_A_Circ)));
+    add(table<&T::R_Circ>(static_cast<std::size_t>(t.N_R_Circ)));
+    add(table<&T::W_Circ>(static_cast<std::size_t>(t.N_W_Circ)));
+    add(table<&T::S_Circ>(static_cast<std::size_t>(t.N_S_Circ)));
+    add(table<&T::Y_Circ>(static_cast<std::size_t>(t.N_Y_Circ)));
+    add(table<&T::Amax>(std::size(xsect_tables::Amax)));
     d_.tables.N_A_Circ = t.N_A_Circ;
     d_.tables.N_R_Circ = t.N_R_Circ;
     d_.tables.N_W_Circ = t.N_W_Circ;
     d_.tables.N_S_Circ = t.N_S_Circ;
     d_.tables.N_Y_Circ = t.N_Y_Circ;
 
-    // State: allocated here, filled from the host at every execute().
-    node_depth_ = alloc<double>("dw_node_depth", nn);
-    d_.node_depth = node_depth_;
-    double** nodes[] = {&d_.node_head,        &d_.node_volume,        &d_.node_overflow,
-                        &d_.node_held_volume, &d_.node_inflow,        &d_.node_outflow,
-                        &d_.node_sumdqdh,     &d_.node_new_surf_area, &d_.node_old_surf_area,
-                        &d_.node_dydt};
-    for (double** field : nodes)
-        *field = alloc<double>("dw_node_state", nn);
-    d_.node_converged = alloc<std::uint8_t>("dw_node_converged", nn);
-    d_.node_is_surcharged = alloc<std::uint8_t>("dw_node_is_surcharged", nn);
-    q1_ = alloc<double>("dw_q1", nc);
-    d_.conduit_q1 = q1_;
-    bypassed_ = alloc<std::uint8_t>("dw_bypassed", nc);
-    d_.conduit_bypassed = bypassed_;
-    double** geometry[] = {&d_.depth1,    &d_.depth2,     &d_.depth_mid,  &d_.h1,
-                           &d_.h2,        &d_.fasnh,      &d_.width1,     &d_.width2,
-                           &d_.width_mid, &d_.surf_area1, &d_.surf_area2, &d_.area1,
-                           &d_.area2,     &d_.area_mid,   &d_.hrad1,      &d_.hrad_mid,
-                           &d_.wcap_d1,   &d_.wcap_d2,    &d_.wcap_dm};
-    for (double** field : geometry)
-        *field = alloc<double>("dw_geometry", nc);
-    d_.flow_class = alloc<std::int8_t>("dw_flow_class", nc);
+    // Lay the fields out in order; the groups are declared in block order.
+    std::size_t at = 0;
+    for (Field& g : fields_) {
+        if (g.sync != Sync::None && g.sync != Sync::Dense && g.elem != 1 && g.elem != 8)
+            throw std::logic_error("dynamic wave device: a compared array is not 1 or 8 bytes");
+        g.offset = at;
+        at = aligned(at + g.elem * g.count);
+        if (g.group == Group::Public)
+            public_end_ = at;
+        if (g.group == Group::Converged)
+            converged_end_ = at;
+    }
+    block_ = Bytes(Kokkos::view_alloc(std::string("dw_block"), Kokkos::WithoutInitializing),
+                   at > 0 ? at : 1);
+    mirror_ = Pinned(Kokkos::view_alloc(std::string("dw_mirror"), Kokkos::WithoutInitializing),
+                     at > 0 ? at : 1);
+    for (const Field& g : fields_)
+        g.point(d_, block_.data() + g.offset);
+}
 
-    // Per-step inputs: filled from the host at every execute(), never copied back.
-    setting_ = alloc<double>("dw_conduit_setting", nc);
-    d_.conduit_setting = setting_;
-    old_flow_ = alloc<double>("dw_conduit_old_flow", nc);
-    d_.conduit_old_flow = old_flow_;
-    area_old_ = alloc<double>("dw_area_old", nc);
-    d_.area_old = area_old_;
-    node_degree_ = alloc<int>("dw_node_degree", nn);
-    d_.node_degree = node_degree_;
-    node_inputs_.clear();
-    for (NodeInput field : kNodeInputs) {
-        node_inputs_.push_back(alloc<double>("dw_node_input", nn));
-        d_.*field = node_inputs_.back();
+void KokkosDwMarcher::uploadAll(const step::Arrays& h) {
+    unsigned char* m = mirror_.data();
+    for (const Field& f : fields_) {
+        const void* src = f.host(h);
+        const std::size_t bytes = f.elem * f.count;
+        if (bytes == 0)
+            continue;
+        if (src == nullptr)
+            throw std::runtime_error("dynamic wave device: a host array is missing");
+        std::memcpy(m + f.offset, src, bytes);
+    }
+    Kokkos::deep_copy(DevBytes(block_.data(), block_.extent(0)),
+                      PinnedBytes(mirror_.data(), mirror_.extent(0)));
+
+    outfalls_.clear();
+    for (int i = 0; i < d_.n_nodes; ++i)
+        if (h.node_is_outfall[i])
+            outfalls_.push_back(i);
+}
+
+void KokkosDwMarcher::stageField(const Field& f, const void* host, const unsigned char* ref,
+                                 bool net) {
+    unsigned char* m = mirror_.data() + f.offset;
+    const auto* src = static_cast<const unsigned char*>(host);
+    const std::size_t e = f.elem;
+    const auto visit = [&](std::size_t i) {
+        const unsigned char* now = src + i * e;
+        unsigned char was[8];
+        if (net) {
+            // The device's old_net_inflow, NodeData::save_hyd_state's expression.
+            double in, out;
+            std::memcpy(&in, mirror_.data() + fields_[inflow_].offset + i * 8, 8);
+            std::memcpy(&out, mirror_.data() + fields_[outflow_].offset + i * 8, 8);
+            const double v = in - out;
+            std::memcpy(was, &v, 8);
+        } else {
+            std::memcpy(was, ref + i * e, e);
+        }
+        if (std::memcmp(now, was, e) == 0)
+            return;
+        Delta d{(f.offset + i * e) | (e == 1 ? kByte : 0), 0};
+        std::memcpy(&d.bits, now, e);
+        deltas_.push_back(d);
+        if (!net && ref == m)
+            std::memcpy(m + i * e, now, e);
+    };
+    if (f.sync == Sync::Outfalls) {
+        for (int i : outfalls_)
+            visit(static_cast<std::size_t>(i));
+        return;
+    }
+    // Whole runs that match are skipped with one memcmp.
+    constexpr std::size_t kRun = 256;
+    for (std::size_t i0 = 0; i0 < f.count; i0 += kRun) {
+        const std::size_t n = (f.count - i0 < kRun) ? f.count - i0 : kRun;
+        if (!net && std::memcmp(src + i0 * e, ref + i0 * e, n * e) == 0)
+            continue;
+        for (std::size_t i = i0; i < i0 + n; ++i)
+            visit(i);
+    }
+}
+
+std::size_t KokkosDwMarcher::stage(const step::Arrays& h, bool inputs) {
+    deltas_.clear();
+    const unsigned char* m = mirror_.data();
+    // The old values first: they compare with the device's state before this call changes it.
+    if (inputs)
+        for (const Field& f : fields_) {
+            if (f.sync == Sync::Derived)
+                stageField(f, f.host(h), m + fields_[f.ref].offset, false);
+            else if (f.sync == Sync::NetInflow)
+                stageField(f, f.host(h), nullptr, true);
+        }
+    for (const Field& f : fields_) {
+        if (!inputs && f.group == Group::Input)
+            continue;
+        if (f.sync == Sync::Compare || f.sync == Sync::Outfalls)
+            stageField(f, f.host(h), m + f.offset, false);
     }
 
-    double** momentum[] = {&d_.link_flow,   &d_.link_dqdh, &d_.link_depth,
-                           &d_.link_volume, &d_.new_flow,  &d_.dqdh,
-                           &d_.velocity,    &d_.froude,    &d_.sigma};
-    for (double** field : momentum)
-        *field = alloc<double>("dw_momentum", nc);
-    d_.category = alloc<std::uint8_t>("dw_category", nc);
-    d_.full_state = alloc<std::int8_t>("dw_full_state", nc);
-    d_.inlet_control = alloc<std::uint8_t>("dw_inlet_control", nc);
-    d_.normal_flow_limited = alloc<std::uint8_t>("dw_normal_flow_limited", nc);
+    const std::size_t lat = inputs ? static_cast<std::size_t>(d_.n_nodes) * sizeof(double) : 0;
+    const std::size_t bytes = lat + deltas_.size() * sizeof(Delta);
+    if (bytes == 0)
+        return 0;
+    if (stage_.extent(0) < bytes) {
+        const std::size_t cap = bytes + bytes / 2;
+        stage_ =
+            Pinned(Kokkos::view_alloc(std::string("dw_stage"), Kokkos::WithoutInitializing), cap);
+        stage_dev_ = Bytes(
+            Kokkos::view_alloc(std::string("dw_stage_dev"), Kokkos::WithoutInitializing), cap);
+    }
+    if (lat > 0)
+        std::memcpy(stage_.data(), h.node_lat_flow, lat);
+    if (!deltas_.empty())
+        std::memcpy(stage_.data() + lat, deltas_.data(), deltas_.size() * sizeof(Delta));
+    Kokkos::deep_copy(DevBytes(stage_dev_.data(), bytes), PinnedBytes(stage_.data(), bytes));
+    uploaded_ += static_cast<long>(deltas_.size());
+    return deltas_.size();
 }
 
-std::vector<Sync> KokkosDwMarcher::stateOf(const step::Arrays& h) const {
-    const int nn = d_.n_nodes, nc = d_.n_conduits;
-    std::vector<Sync> list;
-    pairOf(list, node_depth_, h.node_depth, nn);
-    pairOf(list, d_.node_head, h.node_head, nn);
-    pairOf(list, d_.node_volume, h.node_volume, nn);
-    pairOf(list, d_.node_overflow, h.node_overflow, nn);
-    pairOf(list, d_.node_held_volume, h.node_held_volume, nn);
-    pairOf(list, d_.node_inflow, h.node_inflow, nn);
-    pairOf(list, d_.node_outflow, h.node_outflow, nn);
-    pairOf(list, d_.node_converged, h.node_converged, nn);
-    pairOf(list, d_.node_sumdqdh, h.node_sumdqdh, nn);
-    pairOf(list, d_.node_new_surf_area, h.node_new_surf_area, nn);
-    pairOf(list, d_.node_old_surf_area, h.node_old_surf_area, nn);
-    pairOf(list, d_.node_is_surcharged, h.node_is_surcharged, nn);
-    pairOf(list, d_.node_dydt, h.node_dydt, nn);
-    pairOf(list, q1_, h.conduit_q1, nc);
-    pairOf(list, bypassed_, h.conduit_bypassed, nc);
-    pairOf(list, d_.depth1, h.depth1, nc);
-    pairOf(list, d_.depth2, h.depth2, nc);
-    pairOf(list, d_.depth_mid, h.depth_mid, nc);
-    pairOf(list, d_.h1, h.h1, nc);
-    pairOf(list, d_.h2, h.h2, nc);
-    pairOf(list, d_.fasnh, h.fasnh, nc);
-    pairOf(list, d_.width1, h.width1, nc);
-    pairOf(list, d_.width2, h.width2, nc);
-    pairOf(list, d_.width_mid, h.width_mid, nc);
-    pairOf(list, d_.surf_area1, h.surf_area1, nc);
-    pairOf(list, d_.surf_area2, h.surf_area2, nc);
-    pairOf(list, d_.area1, h.area1, nc);
-    pairOf(list, d_.area2, h.area2, nc);
-    pairOf(list, d_.area_mid, h.area_mid, nc);
-    pairOf(list, d_.hrad1, h.hrad1, nc);
-    pairOf(list, d_.hrad_mid, h.hrad_mid, nc);
-    pairOf(list, d_.wcap_d1, h.wcap_d1, nc);
-    pairOf(list, d_.wcap_d2, h.wcap_d2, nc);
-    pairOf(list, d_.wcap_dm, h.wcap_dm, nc);
-    pairOf(list, d_.flow_class, h.flow_class, nc);
-    pairOf(list, d_.link_flow, h.link_flow, nc);
-    pairOf(list, d_.link_dqdh, h.link_dqdh, nc);
-    pairOf(list, d_.link_depth, h.link_depth, nc);
-    pairOf(list, d_.link_volume, h.link_volume, nc);
-    pairOf(list, d_.new_flow, h.new_flow, nc);
-    pairOf(list, d_.dqdh, h.dqdh, nc);
-    pairOf(list, d_.velocity, h.velocity, nc);
-    pairOf(list, d_.froude, h.froude, nc);
-    pairOf(list, d_.sigma, h.sigma, nc);
-    pairOf(list, d_.category, h.category, nc);
-    pairOf(list, d_.full_state, h.full_state, nc);
-    pairOf(list, d_.inlet_control, h.inlet_control, nc);
-    pairOf(list, d_.normal_flow_limited, h.normal_flow_limited, nc);
-    return list;
+void KokkosDwMarcher::startStep(bool derive, std::size_t deltas) {
+    const step::Arrays D = d_;
+    // DWSolver::execute's step start (area_old, bypassed) and, after the first call, the old
+    // values of NodeData and LinkData save_hyd_state and the lateral inflows.
+    if (derive) {
+        const auto* lat = reinterpret_cast<const double*>(stage_dev_.data());
+        double* old_depth = const_cast<double*>(D.node_old_depth);
+        double* old_volume = const_cast<double*>(D.node_old_volume);
+        double* old_net = const_cast<double*>(D.node_old_net_inflow);
+        double* lat_flow = const_cast<double*>(D.node_lat_flow);
+        Kokkos::parallel_for(
+            "dw_start_nodes", Range(0, D.n_nodes), KOKKOS_LAMBDA(const int i) {
+                old_depth[i] = D.node_depth[i];
+                old_volume[i] = D.node_volume[i];
+                old_net[i] = D.node_inflow[i] - D.node_outflow[i];
+                lat_flow[i] = lat[i];
+            });
+    }
+    double* area_old = const_cast<double*>(D.area_old);
+    double* old_flow = const_cast<double*>(D.conduit_old_flow);
+    Kokkos::parallel_for(
+        "dw_start_conduits", Range(0, D.n_conduits), KOKKOS_LAMBDA(const int c) {
+            area_old[c] = D.area_mid[c];
+            D.conduit_bypassed[c] = 0;
+            if (derive)
+                old_flow[c] = D.link_flow[c];
+        });
+    if (deltas > 0)
+        scatter(derive ? static_cast<std::size_t>(D.n_nodes) * sizeof(double) : 0, deltas);
 }
 
-std::vector<Sync> KokkosDwMarcher::inputsOf(const step::Arrays& h) const {
-    const int nc = d_.n_conduits;
-    std::vector<Sync> list;
-    pairOf(list, setting_, h.conduit_setting, nc);
-    pairOf(list, old_flow_, h.conduit_old_flow, nc);
-    pairOf(list, area_old_, h.area_old, nc);
-    pairOf(list, node_degree_, h.node_degree, d_.n_nodes);
-    for (std::size_t k = 0; k < node_inputs_.size(); ++k)
-        pairOf(list, node_inputs_[k], h.*kNodeInputs[k], d_.n_nodes);
-    return list;
+void KokkosDwMarcher::scatter(std::size_t first, std::size_t count) {
+    unsigned char* const block = block_.data();
+    const auto* list = reinterpret_cast<const Delta*>(stage_dev_.data() + first);
+    Kokkos::parallel_for(
+        "dw_scatter", Range(0, static_cast<int>(count)), KOKKOS_LAMBDA(const int k) {
+            const Delta d = list[k];
+            unsigned char* p = block + (d.at & ~kByte);
+            if (d.at & kByte)
+                *p = static_cast<unsigned char>(d.bits);
+            else
+                *reinterpret_cast<std::uint64_t*>(p) = d.bits;
+        });
+}
+
+void KokkosDwMarcher::download(std::size_t begin, std::size_t end) {
+    if (end > begin)
+        Kokkos::deep_copy(PinnedBytes(mirror_.data() + begin, end - begin),
+                          DevBytes(block_.data() + begin, end - begin));
 }
 
 void KokkosDwMarcher::linkGeometry() {
@@ -411,15 +611,19 @@ void KokkosDwMarcher::momentum(double dt, int iteration) {
 DwDeviceResult KokkosDwMarcher::execute(const DwDeviceStep& step) {
     DwDeviceResult r;
     try {
-        const std::vector<Sync> state = stateOf(step.host);
-        push(state);
-        push(inputsOf(step.host));
-        d_.omega = step.host.omega;
-        d_.normal_flow_ltd = step.host.normal_flow_ltd;
-        d_.inertial_damping = step.host.inertial_damping;
-        d_.head_tol = step.host.head_tol;
-        d_.min_surf_area = step.host.min_surf_area;
-        d_.allow_ponding = step.host.allow_ponding;
+        const step::Arrays& h = step.host;
+        if (step.upload_all) {
+            uploadAll(h);
+            startStep(false, 0);
+        } else {
+            startStep(true, stage(h, true));
+        }
+        d_.omega = h.omega;
+        d_.normal_flow_ltd = h.normal_flow_ltd;
+        d_.inertial_damping = h.inertial_damping;
+        d_.head_tol = h.head_tol;
+        d_.min_surf_area = h.min_surf_area;
+        d_.allow_ponding = h.allow_ponding;
 
         // DWSolver::execute's loop control (DynamicWave.cpp:1567-1687).
         int iterations = 0;
@@ -441,8 +645,17 @@ DwDeviceResult KokkosDwMarcher::execute(const DwDeviceStep& step) {
             }
         }
 
-        Kokkos::fence();
-        pull(state);
+        // The public state, and the convergence flags the host counts when the step did not
+        // converge, in one copy.
+        download(0, converged ? public_end_ : converged_end_);
+        const unsigned char* m = mirror_.data();
+        for (const Field& f : fields_) {
+            if (f.count == 0 ||
+                (f.group != Group::Public && (converged || f.group != Group::Converged)))
+                continue;
+            std::memcpy(const_cast<void*>(f.host(h)), m + f.offset, f.elem * f.count);
+        }
+        r.pulled = converged ? 0u : kDwPullConverged;
         r.iterations = iterations;
         r.converged = converged;
         ++steps_;
@@ -459,26 +672,49 @@ DwDeviceResult KokkosDwMarcher::execute(const DwDeviceStep& step) {
     return r;
 }
 
-std::vector<Sync> KokkosDwMarcher::courantInputsOf(const step::Arrays& h) const {
-    const int nn = d_.n_nodes, nc = d_.n_conduits;
-    std::vector<Sync> list;
-    pairOf(list, d_.link_flow, h.link_flow, nc);
-    pairOf(list, d_.area_mid, h.area_mid, nc);
-    pairOf(list, d_.froude, h.froude, nc);
-    pairOf(list, d_.link_volume, h.link_volume, nc);
-    pairOf(list, node_depth_, h.node_depth, nn);
-    pairOf(list, d_.node_dydt, h.node_dydt, nn);
-    for (std::size_t k = 0; k < node_inputs_.size(); ++k)
-        if (kNodeInputs[k] == &step::Arrays::node_crown_elev)
-            pairOf(list, node_inputs_[k], h.node_crown_elev, nn);
-    return list;
+DwDeviceResult KokkosDwMarcher::pull(const DwDevicePull& request) {
+    DwDeviceResult r;
+    try {
+        // The solver-only groups are contiguous; copy the span from the first wanted to the last.
+        std::size_t begin = 0, end = 0;
+        bool any = false;
+        for (const Field& f : fields_) {
+            if ((pullBit(f.group) & request.groups) == 0)
+                continue;
+            if (!any)
+                begin = f.offset;
+            any = true;
+            end = f.offset + f.elem * f.count;
+        }
+        download(begin, end);
+        const unsigned char* m = mirror_.data();
+        for (const Field& f : fields_) {
+            const unsigned bit = pullBit(f.group);
+            if (bit == 0 || f.offset < begin || f.offset >= end || f.count == 0)
+                continue;
+            std::memcpy(const_cast<void*>(f.host(request.host)), m + f.offset, f.elem * f.count);
+            r.pulled |= bit;
+        }
+    } catch (const std::exception& e) {
+        error_ = e.what();
+        r.ok = false;
+        r.error = error_.c_str();
+    } catch (...) {
+        error_ = "unknown failure in the device state download";
+        r.ok = false;
+        r.error = error_.c_str();
+    }
+    return r;
 }
 
 DwCourantResult KokkosDwMarcher::courantStep(const DwCourantStep& in) {
     DwCourantResult r;
     try {
-        // The host may have changed the state since the last execute(); read it again.
-        push(courantInputsOf(in.host));
+        // The host may have changed the state since the last execute().
+        if (in.upload_all)
+            uploadAll(in.host);
+        else if (const std::size_t n = stage(in.host, false); n > 0)
+            scatter(0, n);
         const step::Arrays D = d_;
         const double fixed = in.fixed_step;
         const double cf = in.courant_factor;
@@ -523,8 +759,10 @@ DwCourantResult KokkosDwMarcher::courantStep(const DwCourantStep& in) {
 
 void KokkosDwMarcher::report() const {
     if (steps_ > 0)
-        std::fprintf(stderr, "[openswmm DW] %s marcher: %ld routing steps, %ld Picard iterations\n",
-                     kLabel, steps_, iterations_);
+        std::fprintf(stderr,
+                     "[openswmm DW] %s marcher: %ld routing steps, %ld Picard iterations, %ld "
+                     "changed elements uploaded\n",
+                     kLabel, steps_, iterations_, uploaded_);
 }
 
 IDwDeviceMarcher* makeKokkosDwMarcher() {

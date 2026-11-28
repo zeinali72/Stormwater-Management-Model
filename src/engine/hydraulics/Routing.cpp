@@ -598,6 +598,9 @@ std::unique_ptr<Router> Router::privateDynamicWaveWindow() const {
     if (model_ != RouteModel::DYNWAVE || checkpoint_context_ || !dw_solver_.isInitialized())
         throw std::runtime_error(
             "Private Richards routing requires initialized dynamic wave outside a checkpoint session.");
+    // Unreachable today (the device scope has no LID nodes); the copy would drop the marcher.
+    if (dw_solver_.hasDeviceMarcher())
+        throw std::runtime_error("Private Richards routing does not run on a DW_BACKEND device.");
     auto r = std::make_unique<Router>();
     r->model_ = model_;
     r->groups_ = groups_;

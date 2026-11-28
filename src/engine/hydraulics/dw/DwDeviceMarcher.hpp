@@ -19,9 +19,19 @@
  * @brief     Interface between DWSolver and a device Picard loop.
  *
  * @details The classic dynamic wave solver keeps one owner of the model state: DWSolver. A device
- *          backend does not replace that class. It replaces the Picard loop of one execute():
- *          the solver hands the marcher its arrays, the marcher iterates the routing step on the
- *          device and hands the arrays back. The work before and after the loop stays on the host.
+ *          backend does not replace that class. It replaces the Picard loop of one execute() and
+ *          the Courant step search, and it keeps the routing state on the device between calls:
+ *
+ *          - static data (geometry, lengths, inverts, tables, the node-to-conduit lists) and the
+ *            whole state are uploaded once, by the first call after bind() or after the solver
+ *            invalidates the device copy (DwDeviceStep::upload_all);
+ *          - after that a call uploads only what the host changed: the lateral inflows, and every
+ *            element of an array the loop reads whose host value differs from the device's;
+ *          - execute() downloads, in one transfer, every array of the model state the host can read
+ *            (the public NodeData, LinkData and ConduitData arrays the loop writes), so no host
+ *            reader of those arrays sees an old value;
+ *          - the solver-only arrays stay on the device; pull() brings them back when the host
+ *            needs them (a checkpoint, a fallback to the CPU loop, [REPORT] LINK_STEPS).
  *
  *          The marcher lives in the GPU plugin (src/engine/hydraulics/dw/gpu), so this header
  *          carries no Kokkos and no engine types: plain structs of raw pointers (DwStepArrays.hpp)
@@ -45,22 +55,33 @@
 
 namespace openswmm::dynwave {
 
-/// Static description of one network, valid for the duration of bind(). Every pointer is a host
-/// array the marcher copies; none is retained.
+/// @name Solver-only array groups that pull() brings back to the host
+/// @{
+inline constexpr unsigned kDwPullConverged = 1u; ///< node convergence flags (DWNodeArrays)
+inline constexpr unsigned kDwPullLinkStep = 2u;  ///< conduit Froude numbers and midpoint areas
+inline constexpr unsigned kDwPullRest = 4u;      ///< every other solver-only array
+inline constexpr unsigned kDwPullAll = 7u;       ///< all of them
+/// @}
+
+/// Sizes of one network for bind(). Only the sizes are read: the marcher allocates its device
+/// arrays and copies nothing until the first execute() or courantStep().
 struct DwDeviceNetwork {
-    /// Sizes, options and static arrays. Its state pointers are ignored here; the marcher points
-    /// them at its own storage.
-    step::Arrays host{};
+    step::Arrays host{}; ///< n_nodes, n_conduits, n_csr and the table sizes
 };
 
-/// One execute() worth of state, on the host. The marcher copies it to the device, iterates, and
-/// copies the state back into the same arrays.
+/// One execute(). Every pointer is read during the call only; none is retained.
 struct DwDeviceStep {
     double dt = 0.0;    ///< routing step, s
     int max_trials = 0; ///< Picard iteration limit
 
-    /// State, per-step inputs and per-step options, all host arrays sized as in DwDeviceNetwork.
-    /// The static pointers are ignored.
+    /// True when the host holds the latest state: the static data and every array are uploaded
+    /// first. The first call after bind() and the first call after the solver changed its own
+    /// arrays on the host must set it.
+    bool upload_all = false;
+
+    /// Every array, on the host, sized as in DwDeviceNetwork (DWSolver::deviceArrays). On return
+    /// the public state arrays (step::Arrays node depth to normal_flow_limited that NodeData,
+    /// LinkData and ConduitData own) hold the step's result.
     step::Arrays host{};
 };
 
@@ -68,6 +89,7 @@ struct DwDeviceStep {
 struct DwDeviceResult {
     int iterations = 0;     ///< Picard iterations performed
     bool converged = false; ///< the last iteration converged
+    unsigned pulled = 0;    ///< solver-only groups (kDwPull*) also brought back to the host
     bool ok = true;         ///< false: `error` says why; the host arrays are unspecified
     const char* error = nullptr;
 };
@@ -76,10 +98,18 @@ struct DwDeviceResult {
 struct DwCourantStep {
     double fixed_step = 0.0;     ///< ROUTING_STEP, s; only a smaller step counts
     double courant_factor = 0.0; ///< the COURANT factor applied to each link's step
+    bool upload_all = false;     ///< as DwDeviceStep::upload_all
 
-    /// The solver's arrays as they are now, sized as in DwDeviceNetwork. The marcher copies in the
-    /// link flows, volumes, midpoint areas and Froude numbers, and the node depths, dY/dt and
-    /// per-step inputs; it changes nothing.
+    /// Every array, as in DwDeviceStep. The search reads the node depths and the link flows and
+    /// volumes as the host holds them now; it changes no state.
+    step::Arrays host{};
+};
+
+/// One pull(): solver-only arrays to bring back to the host.
+struct DwDevicePull {
+    unsigned groups = 0; ///< kDwPull* bits
+
+    /// Host arrays to fill: the solver-only pointers of step::Arrays (DWSolver::solverArrays).
     step::Arrays host{};
 };
 
@@ -103,15 +133,20 @@ class IDwDeviceMarcher {
 public:
     virtual ~IDwDeviceMarcher() = default;
 
-    /// Copy the static network to the device. Called once, after DWSolver::init.
+    /// Allocate the device arrays for a network. Called once, after DWSolver::init.
     virtual void bind(const DwDeviceNetwork& network) = 0;
 
-    /// Run the Picard loop of one routing step on the device.
+    /// Bring the device up to date with the host, run the Picard loop of one routing step there,
+    /// and download the public state.
     virtual DwDeviceResult execute(const DwDeviceStep& step) = 0;
 
-    /// Search the links, then the nodes, for the smallest Courant step, as
-    /// DWSolver::getRoutingStep does; a tie goes to the element searched first.
+    /// Bring the device up to date with the host and search the links, then the nodes, for the
+    /// smallest Courant step, as DWSolver::getRoutingStep does; a tie goes to the element searched
+    /// first.
     virtual DwCourantResult courantStep(const DwCourantStep& step) = 0;
+
+    /// Copy solver-only arrays from the device to the host. The device keeps its copy.
+    virtual DwDeviceResult pull(const DwDevicePull& request) = 0;
 
     /// Short backend label for logs, e.g. "omp" or "cuda".
     virtual const char* label() const noexcept = 0;

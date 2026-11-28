@@ -384,8 +384,9 @@ public:
     /**
      * @brief Bind a device marcher to this network and run every later Picard loop on it.
      *
-     * Requires a completed init() and an empty deviceScope(). The marcher copies the static
-     * network now; every execute() then copies the step's state in and out. Exceptions from the
+     * Requires a completed init() and an empty deviceScope(). The marcher allocates its arrays
+     * now; the first execute() or getRoutingStep() uploads the static network and the whole
+     * state, and the state then stays on the device (DwDeviceMarcher.hpp). Exceptions from the
      * marcher's bind() propagate, and the solver keeps the CPU loop.
      *
      * @param[in] marcher Plugin marcher; null detaches.
@@ -395,7 +396,28 @@ public:
                              const SimulationContext& ctx);
 
     /// True while a device marcher runs the Picard loop.
-    bool hasDeviceMarcher() const noexcept { return static_cast<bool>(device_); }
+    bool hasDeviceMarcher() const noexcept { return static_cast<bool>(device_.marcher); }
+
+    /**
+     * @brief Bring solver-only arrays back from the device marcher, if the host copy is older.
+     *
+     * While a marcher runs the steps, the public NodeData, LinkData and ConduitData arrays are
+     * current on the host after every step, but the solver's own arrays are current only on the
+     * device. Every reader of those arrays on the host calls this first. A no-op without a
+     * marcher, or when the host copy is already current.
+     *
+     * @param[in] groups kDwPull* bits (DwDeviceMarcher.hpp).
+     * @throws std::runtime_error When the marcher fails.
+     */
+    void pullDeviceState(unsigned groups) const;
+
+    /**
+     * @brief Mark the host's arrays as the latest: the next device call uploads all of them.
+     *
+     * Call after the host replaced the solver's or the context's routing state (a checkpoint
+     * restore). The host must hold every array the device reads: pull them first.
+     */
+    void invalidateDevice() noexcept { device_.current = false; }
 
 private:
     friend class ::openswmm::Router; // explicit internal checkpoint fields only
@@ -405,8 +427,30 @@ private:
     int num_threads_ = 1; ///< OpenMP thread count for parallel loops
     const XSectGroups* groups_ = nullptr;
 
-    /// Device Picard loop (DwDeviceMarcher.hpp); null runs the CPU loop.
-    std::shared_ptr<IDwDeviceMarcher> device_;
+    /**
+     * @brief The device marcher, and which copy of the routing state is the latest.
+     *
+     * A copy of the solver gets no marcher, and runs on the CPU; copying a solver whose
+     * solver-only arrays are current only on the device throws std::logic_error, so that no copy
+     * holds old values (pull them first with pullDeviceState(kDwPullAll)).
+     */
+    struct DeviceLink {
+        std::shared_ptr<IDwDeviceMarcher> marcher; ///< null runs the CPU loop
+        /// The device holds the latest state; false: the host does, and the next device call
+        /// uploads all of it.
+        bool current = false;
+        /// With current: the kDwPull* groups of solver-only arrays the host holds as well. The
+        /// public arrays are current on the host after every device call.
+        unsigned host_groups = 0;
+
+        DeviceLink() = default;
+        DeviceLink(const DeviceLink& other);
+        DeviceLink& operator=(const DeviceLink& other);
+        DeviceLink(DeviceLink&&) noexcept = default;
+        DeviceLink& operator=(DeviceLink&&) noexcept = default;
+        ~DeviceLink() = default;
+    };
+    mutable DeviceLink device_;
     /// Outfall boundaries by node, for the device path's static arrays (step::Arrays).
     struct DeviceOutfalls {
         std::vector<uint8_t> is_outfall; ///< 1 for an OUTFALL node
@@ -427,6 +471,9 @@ private:
      * @return Host pointers to the static network and the routing state.
      */
     step::Arrays deviceArrays(SimulationContext& ctx);
+
+    /// Sizes and the solver-only arrays of step::Arrays (the kDwPull* groups), for pull().
+    step::Arrays solverArrays();
 
     /**
      * @brief Check the run-time inputs the device loop does not cover, before a step.

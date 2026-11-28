@@ -105,7 +105,10 @@ extern "C" {
 /* v17: plugins export the dynamic wave Picard loop factory
  * (openswmm_make_gpu_dw_marcher / openswmm_destroy_gpu_dw_marcher). No existing layout changes;
  * the bump keeps a core from attaching a marcher built against other headers. */
-#define OPENSWMM_GPU_ABI_VERSION 17
+/* v18: IDwDeviceMarcher keeps the dynamic wave state on the device between steps: DwDeviceStep
+ * and DwCourantStep add upload_all, DwDeviceResult adds pulled, and the interface adds pull()
+ * (vtable change). Rebuild DW marcher plugins. */
+#define OPENSWMM_GPU_ABI_VERSION 18
 
 /**
  * @name Surface solver capabilities (OpenSwmmGpuProbe::capabilities)

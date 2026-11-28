@@ -1482,11 +1482,17 @@ int DWSolver::execute(SimulationContext& ctx, double dt,
     if (evap_rate > 0.0 || any_conduit_seep_)
         losses_all_zero_ = false;
 
+    // A device marcher runs the step start below that touches the solver's arrays (area_old_,
+    // bypassed_) and the Picard loop in their place (executeOnDevice); the parallel region is then
+    // inactive and its loop runs no iteration.
+    const bool on_device = device_.marcher && deviceStepAllowed(ctx);
+
     // Save area_mid from PREVIOUS TIMESTEP for the unsteady momentum term.
     // This must happen ONCE per timestep, BEFORE the iteration loop, matching
     // legacy dynwave.c:280 which sets a2 = a1 in initRoutingStep().
     // area_mid_ still holds the final midpoint areas from the previous timestep.
-    std::copy(area_mid_.begin(), area_mid_.end(), area_old_.begin());
+    if (!on_device)
+        std::copy(area_mid_.begin(), area_mid_.end(), area_old_.begin());
 
     // TPA latch (issue #156 Phase 5): advanced once per routing step from the
     // last committed state, so Picard/Anderson iterate a FIXED operator.
@@ -1498,12 +1504,15 @@ int DWSolver::execute(SimulationContext& ctx, double dt,
 
     // Clear bypass flags at the start of each timestep
     // (matching legacy initRoutingStep: Link[i].bypassed = FALSE)
-    std::fill(bypassed_.begin(), bypassed_.end(), uint8_t{0});
+    if (!on_device)
+        std::fill(bypassed_.begin(), bypassed_.end(), uint8_t{0});
 
     // Refresh the node-invariant tile for this step (see NodeTile). One
     // sequential pass here replaces seven scattered array reads per node per
-    // Picard iteration inside setNodeDepth/updateNodeDepths.
-    {
+    // Picard iteration inside setNodeDepth/updateNodeDepths. On the device path
+    // only the host's readers after the loop use it, and its inputs are static
+    // there (deviceScope), so it is built once.
+    if (!on_device || node_tile_.size() != static_cast<std::size_t>(n_nodes_)) {
         const auto& nd = ctx.nodes;
         if (node_tile_.size() != static_cast<std::size_t>(n_nodes_))
             node_tile_.resize(static_cast<std::size_t>(n_nodes_));
@@ -1555,9 +1564,6 @@ int DWSolver::execute(SimulationContext& ctx, double dt,
     bool converged_final = false;
     int unconv_shared = 0; // shared team tally (see updateNodeDepthsTeam)
     const bool has_nc = static_cast<bool>(non_conduit_fn);
-    // A device marcher runs the loop below in its place (executeOnDevice); the region is then
-    // inactive and its loop runs no iteration.
-    const bool on_device = device_ && deviceStepAllowed(ctx);
 
 #pragma omp parallel num_threads(num_threads_) if (num_threads_ > 1 && !on_device) default(shared)
     {
@@ -1752,6 +1758,7 @@ int DWSolver::execute(SimulationContext& ctx, double dt,
     // actually responsible. Reporting-only change: does not touch the
     // converged flags, unconv_shared, step convergence, or findBypassedLinks.
     if (!converged) {
+        pullDeviceState(kDwPullConverged);
         for (int i = 0; i < n_nodes_; ++i) {
             auto ui = static_cast<std::size_t>(i);
             if (!node_tile_[ui].is_outfall && !xnode_.converged[ui])
@@ -5036,16 +5043,21 @@ double DWSolver::getRoutingStep(SimulationContext& ctx, double fixed_step, doubl
     int min_node = -1; // index of CFL-critical node
 
     // A device marcher searches the links and nodes in place of the two loops below.
-    const bool on_device = static_cast<bool>(device_);
+    const bool on_device = static_cast<bool>(device_.marcher);
     if (on_device) {
         DwCourantStep in;
         in.fixed_step = fixed_step;
         in.courant_factor = courant_factor;
+        in.upload_all = !device_.current;
         in.host = deviceArrays(ctx);
-        const DwCourantResult r = device_->courantStep(in);
+        const DwCourantResult r = device_.marcher->courantStep(in);
         if (!r.ok)
             throw std::runtime_error(std::string("dynamic wave device Courant step failed: ") +
                                      (r.error ? r.error : "unknown error"));
+        if (in.upload_all) {
+            device_.current = true;
+            device_.host_groups = kDwPullAll;
+        }
         dt_min = r.dt;
         min_link = r.link;
         min_node = r.node;
@@ -5235,6 +5247,7 @@ void DWSolver::accumulateLinkStepStats(SimulationContext& ctx, double dt, double
     if (dt <= 0.0)
         return;
     const double cf = (courant_factor > 0.0) ? courant_factor : 1.0;
+    pullDeviceState(kDwPullConverged | kDwPullLinkStep); // xnode_.converged, getLinkStep
     auto& L = ctx.links;
     for (int j = 0; j < n_links_; ++j) {
         const auto uj = static_cast<std::size_t>(j);
@@ -5338,10 +5351,58 @@ std::string DWSolver::deviceScope(const SimulationContext& ctx) const {
     return {};
 }
 
-step::Arrays DWSolver::deviceArrays(SimulationContext& ctx) {
+step::Arrays DWSolver::solverArrays() {
     step::Arrays A;
     A.n_nodes = n_nodes_;
     A.n_conduits = n_conduits_;
+    A.area_old = area_old_.data();
+    A.node_converged = xnode_.converged.data();
+    A.node_sumdqdh = xnode_.sumdqdh.data();
+    A.node_new_surf_area = xnode_.new_surf_area.data();
+    A.node_old_surf_area = xnode_.old_surf_area.data();
+    A.node_is_surcharged = xnode_.is_surcharged.data();
+    A.node_dydt = xnode_.dYdT.data();
+    A.conduit_q1 = q1_.data();
+    A.conduit_bypassed = bypassed_.data();
+    A.depth1 = depth1_.data();
+    A.depth2 = depth2_.data();
+    A.depth_mid = depth_mid_.data();
+    A.h1 = h1_.data();
+    A.h2 = h2_.data();
+    A.fasnh = fasnh_.data();
+    A.width1 = width1_.data();
+    A.width2 = width2_.data();
+    A.width_mid = width_mid_.data();
+    A.surf_area1 = surf_area1_.data();
+    A.surf_area2 = surf_area2_.data();
+    A.area1 = area1_.data();
+    A.area2 = area2_.data();
+    A.area_mid = area_mid_.data();
+    A.hrad1 = hrad1_.data();
+    A.hrad_mid = hrad_mid_.data();
+    A.wcap_d1 = wcap_d1_.data();
+    A.wcap_d2 = wcap_d2_.data();
+    A.wcap_dm = wcap_dm_.data();
+    A.new_flow = new_flow_.data();
+    A.dqdh = dqdh_.data();
+    A.velocity = velocity_.data();
+    A.froude = froude_.data();
+    A.sigma = sigma_.data();
+    static_assert(sizeof(MomentumCategory) == sizeof(std::uint8_t) &&
+                      static_cast<std::uint8_t>(MomentumCategory::SKIP_DRY) == step::kSkipDry &&
+                      static_cast<std::uint8_t>(MomentumCategory::MANNING_OPEN) ==
+                          step::kManningOpen &&
+                      static_cast<std::uint8_t>(MomentumCategory::MANNING_CLOSED_FS) ==
+                          step::kManningClosedFs &&
+                      static_cast<std::uint8_t>(MomentumCategory::MANNING_CLOSED_FULL) ==
+                          step::kManningClosedFull,
+                  "step::k* momentum codes must match MomentumCategory");
+    A.category = reinterpret_cast<std::uint8_t*>(category_.data());
+    return A;
+}
+
+step::Arrays DWSolver::deviceArrays(SimulationContext& ctx) {
+    step::Arrays A = solverArrays();
     A.surcharge_method = static_cast<int>(surcharge_method);
     A.omega = omega;
     A.normal_flow_ltd = ctx.options.normal_flow_ltd;
@@ -5407,7 +5468,6 @@ step::Arrays DWSolver::deviceArrays(SimulationContext& ctx) {
 
     A.conduit_setting = ctx.links.setting.data();
     A.conduit_old_flow = ctx.links.old_flow.data();
-    A.area_old = area_old_.data();
 
     A.node_depth = ctx.nodes.depth.data();
     A.node_head = ctx.nodes.head.data();
@@ -5416,57 +5476,15 @@ step::Arrays DWSolver::deviceArrays(SimulationContext& ctx) {
     A.node_held_volume = ctx.nodes.held_volume.data();
     A.node_inflow = ctx.nodes.inflow.data();
     A.node_outflow = ctx.nodes.outflow.data();
-    A.node_converged = xnode_.converged.data();
-    A.node_sumdqdh = xnode_.sumdqdh.data();
-    A.node_new_surf_area = xnode_.new_surf_area.data();
-    A.node_old_surf_area = xnode_.old_surf_area.data();
-    A.node_is_surcharged = xnode_.is_surcharged.data();
-    A.node_dydt = xnode_.dYdT.data();
-    A.conduit_q1 = q1_.data();
-    A.conduit_bypassed = bypassed_.data();
 
-    A.depth1 = depth1_.data();
-    A.depth2 = depth2_.data();
-    A.depth_mid = depth_mid_.data();
-    A.h1 = h1_.data();
-    A.h2 = h2_.data();
-    A.fasnh = fasnh_.data();
-    A.width1 = width1_.data();
-    A.width2 = width2_.data();
-    A.width_mid = width_mid_.data();
-    A.surf_area1 = surf_area1_.data();
-    A.surf_area2 = surf_area2_.data();
-    A.area1 = area1_.data();
-    A.area2 = area2_.data();
-    A.area_mid = area_mid_.data();
-    A.hrad1 = hrad1_.data();
-    A.hrad_mid = hrad_mid_.data();
     // FlowClass is an int8_t enumeration, stored as the kernels' codes.
     A.flow_class = reinterpret_cast<std::int8_t*>(ctx.links.flow_class.data());
-    A.wcap_d1 = wcap_d1_.data();
-    A.wcap_d2 = wcap_d2_.data();
-    A.wcap_dm = wcap_dm_.data();
 
     // In scope, conduit c is link c and ConduitData row c (deviceScope).
     A.link_flow = ctx.links.flow.data();
     A.link_dqdh = ctx.links.dqdh.data();
     A.link_depth = ctx.links.depth.data();
     A.link_volume = ctx.links.volume.data();
-    A.new_flow = new_flow_.data();
-    A.dqdh = dqdh_.data();
-    A.velocity = velocity_.data();
-    A.froude = froude_.data();
-    A.sigma = sigma_.data();
-    static_assert(sizeof(MomentumCategory) == sizeof(std::uint8_t) &&
-                      static_cast<std::uint8_t>(MomentumCategory::SKIP_DRY) == step::kSkipDry &&
-                      static_cast<std::uint8_t>(MomentumCategory::MANNING_OPEN) ==
-                          step::kManningOpen &&
-                      static_cast<std::uint8_t>(MomentumCategory::MANNING_CLOSED_FS) ==
-                          step::kManningClosedFs &&
-                      static_cast<std::uint8_t>(MomentumCategory::MANNING_CLOSED_FULL) ==
-                          step::kManningClosedFull,
-                  "step::k* momentum codes must match MomentumCategory");
-    A.category = reinterpret_cast<std::uint8_t*>(category_.data());
     auto& conduits = ctx.link_subtypes.conduits;
     A.full_state = conduits.full_state.data();
     A.inlet_control = conduits.inlet_control.data();
@@ -5476,9 +5494,41 @@ step::Arrays DWSolver::deviceArrays(SimulationContext& ctx) {
     return A;
 }
 
+DWSolver::DeviceLink::DeviceLink(const DeviceLink& other) {
+    if (other.marcher && other.current && other.host_groups != kDwPullAll)
+        throw std::logic_error(
+            "copy of a dynamic wave solver whose state is on the device; pull it first");
+}
+
+DWSolver::DeviceLink& DWSolver::DeviceLink::operator=(const DeviceLink& other) {
+    if (this != &other) {
+        DeviceLink copy(other);
+        *this = std::move(copy);
+    }
+    return *this;
+}
+
+void DWSolver::pullDeviceState(unsigned groups) const {
+    if (!device_.marcher || !device_.current)
+        return;
+    const unsigned missing = groups & kDwPullAll & ~device_.host_groups;
+    if (missing == 0)
+        return;
+    DwDevicePull request;
+    request.groups = missing;
+    // The solver is never a const object: Router and RestartState own it as a plain member.
+    request.host = const_cast<DWSolver*>(this)->solverArrays();
+    const DwDeviceResult r = device_.marcher->pull(request);
+    if (!r.ok)
+        throw std::runtime_error(std::string("dynamic wave device state download failed: ") +
+                                 (r.error ? r.error : "unknown error"));
+    device_.host_groups |= r.pulled;
+}
+
 void DWSolver::attachDeviceMarcher(std::shared_ptr<IDwDeviceMarcher> marcher,
                                    const SimulationContext& ctx) {
-    device_.reset();
+    // Called after init(), which has replaced every array: the old device state is dropped.
+    device_ = DeviceLink{};
     if (!marcher)
         return;
     static_assert(step::kOutfallFree == static_cast<int>(OutfallType::FREE) &&
@@ -5511,7 +5561,7 @@ void DWSolver::attachDeviceMarcher(std::shared_ptr<IDwDeviceMarcher> marcher,
     DwDeviceNetwork network;
     network.host = deviceArrays(const_cast<SimulationContext&>(ctx));
     marcher->bind(network);
-    device_ = std::move(marcher);
+    device_.marcher = std::move(marcher);
 }
 
 bool DWSolver::deviceStepAllowed(SimulationContext& ctx) {
@@ -5540,12 +5590,14 @@ bool DWSolver::deviceStepAllowed(SimulationContext& ctx) {
     if (!why)
         return true;
 
-    std::string token = device_->label();
+    std::string token = device_.marcher->label();
     for (char& c : token)
         c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     ctx.warnings.push_back(
         format_warning(WARN_DW_BACKEND_CPU, token, std::string("(") + why + " during the run)"));
-    device_.reset();
+    // The CPU loop runs from here on, on the host's arrays.
+    pullDeviceState(kDwPullAll);
+    device_ = DeviceLink{};
     return false;
 }
 
@@ -5553,11 +5605,16 @@ int DWSolver::executeOnDevice(SimulationContext& ctx, double dt, bool& converged
     DwDeviceStep step;
     step.dt = dt;
     step.max_trials = max_trials;
+    step.upload_all = !device_.current;
     step.host = deviceArrays(ctx);
-    const DwDeviceResult r = device_->execute(step);
+    // From here the device holds the latest solver-only arrays, also when the call fails.
+    device_.current = true;
+    device_.host_groups = 0;
+    const DwDeviceResult r = device_.marcher->execute(step);
     if (!r.ok)
         throw std::runtime_error(std::string("dynamic wave device loop failed: ") +
                                  (r.error ? r.error : "unknown error"));
+    device_.host_groups = r.pulled;
     converged = r.converged;
     return r.iterations;
 }

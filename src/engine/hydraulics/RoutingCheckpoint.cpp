@@ -18,6 +18,7 @@
 #include "../hydrology/LidNode.hpp"
 #include "Node.hpp"
 #include "../core/UnitConversion.hpp"
+#include "dw/DwDeviceMarcher.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -30,6 +31,11 @@
 
 namespace openswmm {
 namespace {
+/// The solver, with the arrays a device marcher holds brought back to the host first.
+const dynwave::DWSolver& hostCurrent(const dynwave::DWSolver& dw) {
+    dw.pullDeviceState(dynwave::kDwPullAll);
+    return dw;
+}
 using Archive = detail::CompletedSourceArchive;
 constexpr uint64_t maxBytes = 64 * 1024 * 1024;
 constexpr const char* magicName = "OpenSWMM accepted DW hydraulic boundary";
@@ -494,9 +500,10 @@ struct Router::RestartState {
     RestartState(const Router& r, const SimulationContext& c)
         : nodes(c.nodes), links(c.links), storages(c.node_subtypes.storages),
           outfalls(c.node_subtypes.outfalls), conduits(c.link_subtypes.conduits),
-          exports(c.outfall_exports), dw(r.dw_solver_), time(c.current_time), date(c.current_date),
-          elapsed(c.elapsed_ms), old_elapsed(c.old_elapsed_ms), next_report(c.next_report_ms),
-          evap(c.climate_state.evap_rate), infil_factor(c.climate_state.infil_factor),
+          exports(c.outfall_exports), dw(hostCurrent(r.dw_solver_)), time(c.current_time),
+          date(c.current_date), elapsed(c.elapsed_ms), old_elapsed(c.old_elapsed_ms),
+          next_report(c.next_report_ms), evap(c.climate_state.evap_rate),
+          infil_factor(c.climate_state.infil_factor),
           recovery_factor(c.climate_state.recovery_factor), link_steps(r.lstep_enabled_),
           link_step_span(r.lstep_rs_) {
         // This no-LID profile has no old drain load. Native routing creates
@@ -910,6 +917,8 @@ struct Router::RestartState {
 #undef MOVE
         r.dw_solver_.xnode_ = std::move(dw.xnode_);
         r.dw_solver_.dps_ = std::move(dw.dps_);
+        // The host now holds the restored state: a device marcher uploads it at the next step.
+        r.dw_solver_.invalidateDevice();
         c.current_time = time;
         c.current_date = date;
         c.elapsed_ms = elapsed;
@@ -1152,7 +1161,7 @@ std::string Router::checkpointModel(const SimulationContext& c, bool continuatio
     }
     auto outlets = c.lid_node_outlets;
     a.sequence(outlets, [&](auto& p) { a(p.link, p.layer, p.top); });
-    auto d = dw_solver_;
+    auto d = hostCurrent(dw_solver_);
     a(d.num_threads_, d.head_tol, d.max_trials, d.omega, d.surcharge_method, d.node_continuity,
       d.anderson_accel, d.unsteady_friction, d.uf_k3, d.tpa_celerity, d.dps_config_.c_pT,
       d.dps_config_.alpha, d.dps_config_.r);
